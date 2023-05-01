@@ -21,6 +21,7 @@ import io.moquette.api.Subscription;
 import io.moquette.api.Topic;
 import io.moquette.broker.security.IAuthenticator;
 import io.moquette.broker.security.IAuthorizatorPolicy;
+import io.moquette.broker.security.IConnectionFilter;
 import io.moquette.broker.security.PermitAllAuthorizatorPolicy;
 import io.moquette.broker.subscriptions.CTrieSubscriptionDirectory;
 import io.moquette.persistence.MemorySubscriptionsRepository;
@@ -28,7 +29,13 @@ import io.netty.buffer.ByteBuf;
 import io.netty.buffer.Unpooled;
 import io.netty.channel.Channel;
 import io.netty.channel.embedded.EmbeddedChannel;
-import io.netty.handler.codec.mqtt.*;
+import io.netty.handler.codec.mqtt.MqttConnAckMessage;
+import io.netty.handler.codec.mqtt.MqttConnectMessage;
+import io.netty.handler.codec.mqtt.MqttMessageBuilders;
+import io.netty.handler.codec.mqtt.MqttPublishMessage;
+import io.netty.handler.codec.mqtt.MqttQoS;
+import io.netty.handler.codec.mqtt.MqttSubAckMessage;
+import io.netty.handler.codec.mqtt.MqttSubscribeMessage;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 
@@ -64,6 +71,7 @@ public class PostOfficeSubscribeTest {
     public static final String FAKE_USER_NAME = "UnAuthUser";
     private MqttConnectMessage connectMessage;
     private IAuthenticator mockAuthenticator;
+    private IConnectionFilter mockConnectionFilter;
     private SessionRegistry sessionRegistry;
     public static final BrokerConfiguration CONFIG = new BrokerConfiguration(true, true, false, false);
     private MemoryQueueRepository queueRepository;
@@ -85,6 +93,7 @@ public class PostOfficeSubscribeTest {
 
     private void prepareSUT() {
         mockAuthenticator = new MockAuthenticator(singleton(FAKE_CLIENT_ID), singletonMap(TEST_USER, TEST_PWD));
+        mockConnectionFilter = new MockConnectionFilter();
 
         subscriptions = new CTrieSubscriptionDirectory();
         ISubscriptionsRepository subscriptionsRepository = new MemorySubscriptionsRepository();
@@ -99,7 +108,7 @@ public class PostOfficeSubscribeTest {
     }
 
     private MQTTConnection createMQTTConnection(BrokerConfiguration config, Channel channel) {
-        return new MQTTConnection(channel, config, mockAuthenticator, sessionRegistry, sut);
+        return new MQTTConnection(channel, config, mockAuthenticator, mockConnectionFilter, sessionRegistry, sut);
     }
 
     protected void connect() {

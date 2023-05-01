@@ -18,6 +18,7 @@ package io.moquette.broker;
 import io.moquette.api.ISubscriptionsDirectory;
 import io.moquette.api.ISubscriptionsRepository;
 import io.moquette.broker.security.IAuthenticator;
+import io.moquette.broker.security.IConnectionFilter;
 import io.moquette.broker.security.PermitAllAuthorizatorPolicy;
 import io.moquette.broker.subscriptions.CTrieSubscriptionDirectory;
 import io.moquette.persistence.MemorySubscriptionsRepository;
@@ -30,10 +31,15 @@ import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 
 import static io.moquette.broker.NettyChannelAssertions.assertEqualsConnAck;
-import static io.netty.handler.codec.mqtt.MqttConnectReturnCode.*;
+import static io.netty.handler.codec.mqtt.MqttConnectReturnCode.CONNECTION_ACCEPTED;
+import static io.netty.handler.codec.mqtt.MqttConnectReturnCode.CONNECTION_REFUSED_BAD_USER_NAME_OR_PASSWORD;
+import static io.netty.handler.codec.mqtt.MqttConnectReturnCode.CONNECTION_REFUSED_BANNED;
+import static io.netty.handler.codec.mqtt.MqttConnectReturnCode.CONNECTION_REFUSED_IDENTIFIER_REJECTED;
 import static java.util.Collections.singleton;
 import static java.util.Collections.singletonMap;
-import static org.junit.jupiter.api.Assertions.*;
+import static org.junit.jupiter.api.Assertions.assertFalse;
+import static org.junit.jupiter.api.Assertions.assertNotNull;
+import static org.junit.jupiter.api.Assertions.assertTrue;
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.verify;
@@ -52,6 +58,7 @@ public class MQTTConnectionConnectTest {
     private MqttMessageBuilders.ConnectBuilder connMsg;
     private static final BrokerConfiguration CONFIG = new BrokerConfiguration(true, true, false, false);
     private IAuthenticator mockAuthenticator;
+    private MockConnectionFilter mockConnectionFilter;
     private PostOffice postOffice;
     private MemoryQueueRepository queueRepository;
 
@@ -60,6 +67,7 @@ public class MQTTConnectionConnectTest {
         connMsg = MqttMessageBuilders.connect().protocolVersion(MqttVersion.MQTT_3_1).cleanSession(true);
 
         mockAuthenticator = new MockAuthenticator(singleton(FAKE_CLIENT_ID), singletonMap(TEST_USER, TEST_PWD));
+        mockConnectionFilter = new MockConnectionFilter();
 
         ISubscriptionsDirectory subscriptions = new CTrieSubscriptionDirectory();
         ISubscriptionsRepository subscriptionsRepository = new MemorySubscriptionsRepository();
@@ -87,7 +95,7 @@ public class MQTTConnectionConnectTest {
     }
 
     private MQTTConnection createMQTTConnection(BrokerConfiguration config, Channel channel, PostOffice postOffice) {
-        return new MQTTConnection(channel, config, mockAuthenticator, sessionRegistry, postOffice);
+        return new MQTTConnection(channel, config, mockAuthenticator, mockConnectionFilter, sessionRegistry, postOffice);
     }
 
     @Test
@@ -174,6 +182,21 @@ public class MQTTConnectionConnectTest {
         // Verify
         assertEqualsConnAck(CONNECTION_ACCEPTED, channel.readOutbound());
         assertTrue(channel.isOpen(), "Connection is accepted and therefore must remain open");
+    }
+
+    @Test
+    public void validAuthenticationBannedClient() {
+        MqttConnectMessage msg = connMsg.clientId(FAKE_CLIENT_ID)
+            .username(TEST_USER).password(TEST_PWD).build();
+
+        mockConnectionFilter.banClientId(FAKE_CLIENT_ID);
+
+        // Exercise
+        sut.processConnect(msg);
+
+        // Verify
+        assertEqualsConnAck(CONNECTION_REFUSED_BANNED, channel.readOutbound());
+        assertFalse(channel.isOpen(), "Connection is refused / banned and therefore must not remain open");
     }
 
     @Test

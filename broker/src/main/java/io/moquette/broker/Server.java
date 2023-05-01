@@ -16,16 +16,29 @@
 package io.moquette.broker;
 
 import io.moquette.BrokerConstants;
-import io.moquette.api.*;
-import io.moquette.broker.config.*;
+import io.moquette.api.IQueueRepository;
+import io.moquette.api.IRetainedRepository;
+import io.moquette.api.ISslContextCreator;
+import io.moquette.api.ISubscriptionsDirectory;
+import io.moquette.api.ISubscriptionsRepository;
+import io.moquette.broker.config.FileResourceLoader;
+import io.moquette.broker.config.IConfig;
+import io.moquette.broker.config.IResourceLoader;
+import io.moquette.broker.config.MemoryConfig;
+import io.moquette.broker.config.ResourceLoaderConfig;
+import io.moquette.broker.security.ACLFileParser;
+import io.moquette.broker.security.AcceptAllAuthenticator;
+import io.moquette.broker.security.DenyAllAuthorizatorPolicy;
+import io.moquette.broker.security.IAuthenticator;
+import io.moquette.broker.security.IAuthorizatorPolicy;
+import io.moquette.broker.security.IConnectionFilter;
+import io.moquette.broker.security.PermitAllAuthorizatorPolicy;
+import io.moquette.broker.security.ResourceAuthenticator;
+import io.moquette.broker.subscriptions.CTrieSubscriptionDirectory;
+import io.moquette.interception.BrokerInterceptor;
 import io.moquette.interception.InterceptHandler;
 import io.moquette.persistence.H2Builder;
 import io.moquette.persistence.MemorySubscriptionsRepository;
-import io.moquette.interception.BrokerInterceptor;
-import io.moquette.broker.security.*;
-import io.moquette.broker.subscriptions.CTrieSubscriptionDirectory;
-import io.moquette.broker.security.IAuthenticator;
-import io.moquette.broker.security.IAuthorizatorPolicy;
 import io.netty.handler.codec.mqtt.MqttPublishMessage;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -34,7 +47,11 @@ import java.io.File;
 import java.io.IOException;
 import java.lang.reflect.InvocationTargetException;
 import java.text.ParseException;
-import java.util.*;
+import java.util.ArrayList;
+import java.util.Collection;
+import java.util.Collections;
+import java.util.List;
+import java.util.Properties;
 import java.util.concurrent.Executors;
 import java.util.concurrent.ScheduledExecutorService;
 
@@ -130,11 +147,11 @@ public class Server {
      */
     public void startServer(IConfig config, List<? extends InterceptHandler> handlers) throws IOException {
         LOG.debug("Starting moquette integration using IConfig instance and intercept handlers");
-        startServer(config, handlers, null, null, null);
+        startServer(config, handlers, null, null, null, null);
     }
 
     public void startServer(IConfig config, List<? extends InterceptHandler> handlers, ISslContextCreator sslCtxCreator,
-                            IAuthenticator authenticator, IAuthorizatorPolicy authorizatorPolicy) {
+                            IAuthenticator authenticator, IConnectionFilter connectionFilter, IAuthorizatorPolicy authorizatorPolicy) {
         final long start = System.currentTimeMillis();
         if (handlers == null) {
             handlers = Collections.emptyList();
@@ -156,6 +173,7 @@ public class Server {
             sslCtxCreator = new DefaultMoquetteSslContextCreator(config);
         }
         authenticator = initializeAuthenticator(authenticator, config);
+        connectionFilter = initializeConnectionFilter(connectionFilter, config);
         authorizatorPolicy = initializeAuthorizatorPolicy(authorizatorPolicy, config);
 
         final ISubscriptionsRepository subscriptionsRepository;
@@ -180,7 +198,7 @@ public class Server {
         sessions = new SessionRegistry(subscriptions, queueRepository, authorizator);
         dispatcher = new PostOffice(subscriptions, retainedRepository, sessions, interceptor, authorizator);
         final BrokerConfiguration brokerConfig = new BrokerConfiguration(config);
-        MQTTConnectionFactory connectionFactory = new MQTTConnectionFactory(brokerConfig, authenticator, sessions,
+        MQTTConnectionFactory connectionFactory = new MQTTConnectionFactory(brokerConfig, authenticator, connectionFilter, sessions,
                                                                             dispatcher);
 
         final NewNettyMQTTHandler mqttHandler = new NewNettyMQTTHandler(connectionFactory);
@@ -190,6 +208,15 @@ public class Server {
         final long startTime = System.currentTimeMillis() - start;
         LOG.info("Moquette integration has been started successfully in {} ms", startTime);
         initialized = true;
+    }
+
+    private IConnectionFilter initializeConnectionFilter(IConnectionFilter connectionFilter, IConfig props) {
+        LOG.debug("Configuring MQTT connection filter policy");
+        String filterClassName = props.getProperty(BrokerConstants.CONNECTION_FILTER_CLASS_NAME, "");
+        if (connectionFilter == null && !filterClassName.isEmpty()) {
+            connectionFilter = loadClass(filterClassName, IConnectionFilter.class, IConfig.class, props);
+        }
+        return connectionFilter;
     }
 
     private IAuthorizatorPolicy initializeAuthorizatorPolicy(IAuthorizatorPolicy authorizatorPolicy, IConfig props) {

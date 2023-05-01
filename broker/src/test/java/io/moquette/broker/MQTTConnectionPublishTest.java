@@ -77,7 +77,7 @@ public class MQTTConnectionPublishTest {
         sessionRegistry = new SessionRegistry(subscriptions, queueRepository, permitAll);
         final PostOffice postOffice = new PostOffice(subscriptions,
             new MemoryRetainedRepository(), sessionRegistry, ConnectionTestUtils.NO_OBSERVERS_INTERCEPTOR, permitAll);
-        return new MQTTConnection(channel, config, mockAuthenticator, sessionRegistry, postOffice);
+        return new MQTTConnection(channel, config, mockAuthenticator, null, sessionRegistry, postOffice);
     }
 
     @Test

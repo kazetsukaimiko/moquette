@@ -120,7 +120,7 @@ public class SessionTest {
 
     private void createConnection(Session client) {
         BrokerConfiguration brokerConfiguration = new BrokerConfiguration(true, false, false, false);
-        MQTTConnection mqttConnection = new MQTTConnection(testChannel, brokerConfiguration, null, null, null);
+        MQTTConnection mqttConnection = new MQTTConnection(testChannel, brokerConfiguration, null, null, null, null);
         client.markConnecting();
         client.bind(mqttConnection);
         client.completeConnection();

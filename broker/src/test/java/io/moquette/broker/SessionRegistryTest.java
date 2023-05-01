@@ -21,6 +21,7 @@ import io.moquette.api.ISubscriptionsRepository;
 import io.moquette.api.PublishedMessage;
 import io.moquette.api.Topic;
 import io.moquette.broker.security.IAuthenticator;
+import io.moquette.broker.security.IConnectionFilter;
 import io.moquette.broker.security.PermitAllAuthorizatorPolicy;
 import io.moquette.broker.subscriptions.CTrieSubscriptionDirectory;
 import io.moquette.persistence.EnqueuedMessageValueType;
@@ -45,7 +46,9 @@ import static io.moquette.broker.NettyChannelAssertions.assertEqualsConnAck;
 import static io.netty.handler.codec.mqtt.MqttConnectReturnCode.CONNECTION_ACCEPTED;
 import static java.util.Collections.singleton;
 import static java.util.Collections.singletonMap;
-import static org.junit.jupiter.api.Assertions.*;
+import static org.junit.jupiter.api.Assertions.assertEquals;
+import static org.junit.jupiter.api.Assertions.assertFalse;
+import static org.junit.jupiter.api.Assertions.assertTrue;
 
 public class SessionRegistryTest {
 
@@ -76,6 +79,7 @@ public class SessionRegistryTest {
     private MQTTConnection createMQTTConnection(BrokerConfiguration config, Channel channel) {
         IAuthenticator mockAuthenticator = new MockAuthenticator(singleton(FAKE_CLIENT_ID),
                                                                  singletonMap(TEST_USER, TEST_PWD));
+        IConnectionFilter connectionFilter = new MockConnectionFilter();
 
         ISubscriptionsDirectory subscriptions = new CTrieSubscriptionDirectory();
         ISubscriptionsRepository subscriptionsRepository = new MemorySubscriptionsRepository();
@@ -87,7 +91,7 @@ public class SessionRegistryTest {
         sut = new SessionRegistry(subscriptions, queueRepository, permitAll);
         final PostOffice postOffice = new PostOffice(subscriptions,
             new MemoryRetainedRepository(), sut, ConnectionTestUtils.NO_OBSERVERS_INTERCEPTOR, permitAll);
-        return new MQTTConnection(channel, config, mockAuthenticator, sut, postOffice);
+        return new MQTTConnection(channel, config, mockAuthenticator, connectionFilter, sut, postOffice);
     }
 
     @Test
