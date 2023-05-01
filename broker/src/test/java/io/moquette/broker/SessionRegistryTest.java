@@ -16,15 +16,12 @@
 package io.moquette.broker;
 
 import io.moquette.BrokerConstants;
-import io.moquette.api.ISubscriptionsDirectory;
-import io.moquette.api.ISubscriptionsRepository;
-import io.moquette.api.PublishedMessage;
-import io.moquette.api.Topic;
-import io.moquette.broker.security.IAuthenticator;
-import io.moquette.broker.security.IConnectionFilter;
+import io.moquette.persistence.EnqueuedMessageValueType;
 import io.moquette.broker.security.PermitAllAuthorizatorPolicy;
 import io.moquette.broker.subscriptions.CTrieSubscriptionDirectory;
-import io.moquette.persistence.EnqueuedMessageValueType;
+import io.moquette.broker.subscriptions.ISubscriptionsDirectory;
+import io.moquette.broker.security.IAuthenticator;
+import io.moquette.broker.subscriptions.Topic;
 import io.moquette.persistence.MemorySubscriptionsRepository;
 import io.netty.buffer.ByteBuf;
 import io.netty.buffer.Unpooled;
@@ -41,7 +38,10 @@ import org.junit.jupiter.api.Test;
 
 import java.io.File;
 import java.nio.charset.StandardCharsets;
+import java.util.concurrent.ExecutionException;
 
+import static io.moquette.broker.MQTTConnectionPublishTest.memorySessionsRepository;
+import static io.moquette.BrokerConstants.NO_BUFFER_FLUSH;
 import static io.moquette.broker.NettyChannelAssertions.assertEqualsConnAck;
 import static io.netty.handler.codec.mqtt.MqttConnectReturnCode.CONNECTION_ACCEPTED;
 import static java.util.Collections.singleton;
@@ -61,7 +61,7 @@ public class SessionRegistryTest {
     private SessionRegistry sut;
     private MqttMessageBuilders.ConnectBuilder connMsg;
     private static final BrokerConfiguration ALLOW_ANONYMOUS_AND_ZEROBYTE_CLIENT_ID =
-        new BrokerConfiguration(true, true, false, false);
+        new BrokerConfiguration(true, true, false, NO_BUFFER_FLUSH);
     private MemoryQueueRepository queueRepository;
 
     @BeforeEach
@@ -79,7 +79,6 @@ public class SessionRegistryTest {
     private MQTTConnection createMQTTConnection(BrokerConfiguration config, Channel channel) {
         IAuthenticator mockAuthenticator = new MockAuthenticator(singleton(FAKE_CLIENT_ID),
                                                                  singletonMap(TEST_USER, TEST_PWD));
-        IConnectionFilter connectionFilter = new MockConnectionFilter();
 
         ISubscriptionsDirectory subscriptions = new CTrieSubscriptionDirectory();
         ISubscriptionsRepository subscriptionsRepository = new MemorySubscriptionsRepository();
@@ -88,10 +87,11 @@ public class SessionRegistryTest {
 
         final PermitAllAuthorizatorPolicy authorizatorPolicy = new PermitAllAuthorizatorPolicy();
         final Authorizator permitAll = new Authorizator(authorizatorPolicy);
-        sut = new SessionRegistry(subscriptions, queueRepository, permitAll);
+        sut = new SessionRegistry(subscriptions, memorySessionsRepository(), queueRepository, permitAll);
+        final SessionEventLoopGroup loopsGroup = new SessionEventLoopGroup(ConnectionTestUtils.NO_OBSERVERS_INTERCEPTOR, 1024);
         final PostOffice postOffice = new PostOffice(subscriptions,
-            new MemoryRetainedRepository(), sut, ConnectionTestUtils.NO_OBSERVERS_INTERCEPTOR, permitAll);
-        return new MQTTConnection(channel, config, mockAuthenticator, connectionFilter, sut, postOffice);
+            new MemoryRetainedRepository(), sut, ConnectionTestUtils.NO_OBSERVERS_INTERCEPTOR, permitAll, loopsGroup);
+        return new MQTTConnection(channel, config, mockAuthenticator, sut, postOffice);
     }
 
     @Test
@@ -120,12 +120,12 @@ public class SessionRegistryTest {
     }
 
     @Test
-    public void connectWithCleanSessionUpdateClientSession() {
+    public void connectWithCleanSessionUpdateClientSession() throws ExecutionException, InterruptedException {
         // first connect with clean session true
         MqttConnectMessage msg = connMsg.clientId(FAKE_CLIENT_ID).cleanSession(true).build();
-        connection.processConnect(msg);
+        connection.processConnect(msg).completableFuture().get();
         assertEqualsConnAck(CONNECTION_ACCEPTED, channel.readOutbound());
-        connection.processDisconnect(null);
+        connection.processDisconnect(null).completableFuture().get();
         assertFalse(channel.isOpen());
 
         // second connect with clean session false
@@ -137,7 +137,7 @@ public class SessionRegistryTest {
             .protocolVersion(MqttVersion.MQTT_3_1)
             .build();
 
-        anotherConnection.processConnect(secondConnMsg);
+        anotherConnection.processConnect(secondConnMsg).completableFuture().get();
         assertEqualsConnAck(CONNECTION_ACCEPTED, anotherChannel.readOutbound());
 
         // Verify client session is clean false
@@ -151,17 +151,17 @@ public class SessionRegistryTest {
             .fileName(BrokerConstants.DEFAULT_PERSISTENT_PATH)
             .autoCommitDisabled()
             .open();
-        final MVMap.Builder<String, PublishedMessage> builder =
-            new MVMap.Builder<String, PublishedMessage>()
+        final MVMap.Builder<String, SessionRegistry.PublishedMessage> builder =
+            new MVMap.Builder<String, SessionRegistry.PublishedMessage>()
                 .valueType(new EnqueuedMessageValueType());
 
         final ByteBuf payload = Unpooled.wrappedBuffer("Hello World!".getBytes(StandardCharsets.UTF_8));
-        PublishedMessage msg = new PublishedMessage(Topic.asTopic("/say"),
-            MqttQoS.AT_LEAST_ONCE, payload);
+        SessionRegistry.PublishedMessage msg = new SessionRegistry.PublishedMessage(Topic.asTopic("/say"),
+            MqttQoS.AT_LEAST_ONCE, payload, false);
         try {
             // store a message in the MVStore
             final String mapName = "test_map";
-            MVMap<String, PublishedMessage> persistentMap = mvStore.openMap(mapName, builder);
+            MVMap<String, SessionRegistry.PublishedMessage> persistentMap = mvStore.openMap(mapName, builder);
             String key = "message";
             persistentMap.put(key, msg);
             mvStore.close();
@@ -171,10 +171,10 @@ public class SessionRegistryTest {
                 .fileName(BrokerConstants.DEFAULT_PERSISTENT_PATH)
                 .autoCommitDisabled()
                 .open();
-            final PublishedMessage reloadedMsg = mvStore.openMap(mapName, builder).get(key);
+            final SessionRegistry.PublishedMessage reloadedMsg = mvStore.openMap(mapName, builder).get(key);
 
             // Verify
-            assertEquals("/say", reloadedMsg.getTopic().toString());
+            assertEquals("/say", reloadedMsg.topic.toString());
         } finally {
             mvStore.close();
             File dbFile = new File(BrokerConstants.DEFAULT_PERSISTENT_PATH);

@@ -1,24 +1,25 @@
 package io.moquette.broker;
 
-import io.moquette.api.EnqueuedMessage;
-import io.moquette.api.Subscription;
-import io.moquette.api.Topic;
+import io.moquette.broker.subscriptions.Topic;
 import io.netty.buffer.ByteBuf;
 import io.netty.buffer.ByteBufUtil;
 import io.netty.buffer.UnpooledByteBufAllocator;
 import io.netty.channel.embedded.EmbeddedChannel;
 import io.netty.handler.codec.mqtt.MqttQoS;
-import org.assertj.core.api.Assertions;
+import io.netty.handler.codec.mqtt.MqttVersion;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 
-import java.util.Arrays;
-import java.util.Queue;
-import java.util.concurrent.ConcurrentLinkedQueue;
-
 import static io.moquette.BrokerConstants.FLIGHT_BEFORE_RESEND_MS;
-import static org.junit.jupiter.api.Assertions.assertEquals;
+import io.moquette.broker.subscriptions.Subscription;
+import java.util.Arrays;
+import org.assertj.core.api.Assertions;
+
+import static io.moquette.broker.Session.INFINITE_EXPIRY;
+import static org.junit.jupiter.api.Assertions.assertFalse;
 import static org.junit.jupiter.api.Assertions.assertTrue;
+import static io.moquette.BrokerConstants.NO_BUFFER_FLUSH;
+import static org.junit.jupiter.api.Assertions.*;
 
 public class SessionTest {
 
@@ -26,13 +27,14 @@ public class SessionTest {
 
     private EmbeddedChannel testChannel;
     private Session client;
-    private Queue<EnqueuedMessage> queuedMessages;
+    private SessionMessageQueue<SessionRegistry.EnqueuedMessage> queuedMessages;
 
     @BeforeEach
     public void setUp() {
         testChannel = new EmbeddedChannel();
-        queuedMessages = new ConcurrentLinkedQueue<>();
-        client = new Session(CLIENT_ID, true, null, queuedMessages);
+        queuedMessages = new InMemoryQueue();
+        final ISessionsRepository.SessionData data = new ISessionsRepository.SessionData(CLIENT_ID, MqttVersion.MQTT_3_1_1, INFINITE_EXPIRY);
+        client = new Session(data, true, null, queuedMessages);
         createConnection(client);
     }
 
@@ -45,13 +47,13 @@ public class SessionTest {
             sendQoS1To(client, destinationTopic, "Hello World " + i + "!");
         }
 
-        assertEquals(1, queuedMessages.size(), "Inflight zone must be full, and the 11th message must be queued");
+        assertFalse(queuedMessages.isEmpty(), "Inflight zone must be full, and the 11th message must be queued");
         // Exercise
         client.pubAckReceived(1);
 
         // Verify
         assertTrue(queuedMessages.isEmpty(), "Messages should be drained");
-        
+
         // release the rest, to avoid leaking buffers
         for (int i = 2; i <= 11; i++) {
             client.pubAckReceived(i);
@@ -62,7 +64,7 @@ public class SessionTest {
 
     private void sendQoS1To(Session client, Topic destinationTopic, String message) {
         final ByteBuf payload = ByteBufUtil.writeUtf8(UnpooledByteBufAllocator.DEFAULT, message);
-        client.sendPublishOnSessionAtQos(destinationTopic, MqttQoS.AT_LEAST_ONCE, payload);
+        client.sendNotRetainedPublishOnSessionAtQos(destinationTopic, MqttQoS.AT_LEAST_ONCE, payload);
     }
 
     @Test
@@ -119,8 +121,8 @@ public class SessionTest {
     }
 
     private void createConnection(Session client) {
-        BrokerConfiguration brokerConfiguration = new BrokerConfiguration(true, false, false, false);
-        MQTTConnection mqttConnection = new MQTTConnection(testChannel, brokerConfiguration, null, null, null, null);
+        BrokerConfiguration brokerConfiguration = new BrokerConfiguration(true, false, false, NO_BUFFER_FLUSH);
+        MQTTConnection mqttConnection = new MQTTConnection(testChannel, brokerConfiguration, null, null, null);
         client.markConnecting();
         client.bind(mqttConnection);
         client.completeConnection();

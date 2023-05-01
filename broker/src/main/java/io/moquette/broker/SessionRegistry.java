@@ -15,28 +15,86 @@
  */
 package io.moquette.broker;
 
-import io.moquette.api.EnqueuedMessage;
-import io.moquette.api.IQueueRepository;
-import io.moquette.api.ISubscriptionsDirectory;
-import io.moquette.api.Subscription;
 import io.moquette.broker.Session.SessionStatus;
+import io.moquette.broker.subscriptions.ISubscriptionsDirectory;
+import io.moquette.broker.subscriptions.Subscription;
+import io.moquette.broker.subscriptions.Topic;
 import io.netty.buffer.ByteBuf;
 import io.netty.buffer.Unpooled;
 import io.netty.handler.codec.mqtt.MqttConnectMessage;
 import io.netty.handler.codec.mqtt.MqttQoS;
+import io.netty.handler.codec.mqtt.MqttVersion;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 import java.net.InetSocketAddress;
+import java.util.Arrays;
 import java.util.Collection;
-import java.util.Map;
 import java.util.Optional;
-import java.util.Queue;
+import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ConcurrentMap;
 import java.util.stream.Collectors;
 
+import static io.moquette.broker.Session.INFINITE_EXPIRY;
+
 public class SessionRegistry {
+
+    public abstract static class EnqueuedMessage {
+
+        /**
+         * Releases any held resources. Must be called when the EnqueuedMessage is no
+         * longer needed.
+         */
+        public void release() {}
+
+        /**
+         * Retains any held resources. Must be called when the EnqueuedMessage is added
+         * to a store.
+         */
+        public void retain() {}
+    }
+
+    public static class PublishedMessage extends EnqueuedMessage {
+
+        final Topic topic;
+        final MqttQoS publishingQos;
+        final ByteBuf payload;
+        final boolean retained;
+
+        public PublishedMessage(Topic topic, MqttQoS publishingQos, ByteBuf payload, boolean retained) {
+            this.topic = topic;
+            this.publishingQos = publishingQos;
+            this.payload = payload;
+            this.retained = false;
+        }
+
+        public Topic getTopic() {
+            return topic;
+        }
+
+        public MqttQoS getPublishingQos() {
+            return publishingQos;
+        }
+
+        public ByteBuf getPayload() {
+            return payload;
+        }
+
+        @Override
+        public void release() {
+            payload.release();
+        }
+
+        @Override
+        public void retain() {
+            payload.retain();
+        }
+
+    }
+
+    public static final class PubRelMarker extends EnqueuedMessage {
+    }
 
     public enum CreationModeEnum {
         CREATED_CLEAN_NEW, REOPEN_EXISTING, DROP_EXISTING
@@ -59,108 +117,89 @@ public class SessionRegistry {
 
     private final ConcurrentMap<String, Session> pool = new ConcurrentHashMap<>();
     private final ISubscriptionsDirectory subscriptionsDirectory;
+    private final ISessionsRepository sessionsRepository;
     private final IQueueRepository queueRepository;
     private final Authorizator authorizator;
-    private final ConcurrentMap<String, Queue<EnqueuedMessage>> queues = new ConcurrentHashMap<>();
 
     SessionRegistry(ISubscriptionsDirectory subscriptionsDirectory,
+                    ISessionsRepository sessionsRepository,
                     IQueueRepository queueRepository,
                     Authorizator authorizator) {
         this.subscriptionsDirectory = subscriptionsDirectory;
+        this.sessionsRepository = sessionsRepository;
         this.queueRepository = queueRepository;
         this.authorizator = authorizator;
-        reloadPersistentQueues();
         recreateSessionPool();
     }
 
-    private void reloadPersistentQueues() {
-        final Map<String, Queue<EnqueuedMessage>> persistentQueues = queueRepository.listAllQueues();
-        persistentQueues.forEach(queues::put);
-    }
-
     private void recreateSessionPool() {
-        for (String clientId : subscriptionsDirectory.listAllSessionIds()) {
+        final Set<String> queues = queueRepository.listQueueNames();
+        for (ISessionsRepository.SessionData session : sessionsRepository.list()) {
             // if the subscriptions are present is obviously false
-            final Queue<EnqueuedMessage> persistentQueue = queues.get(clientId);
-            if (persistentQueue != null) {
-                Session rehydrated = new Session(clientId, false, persistentQueue);
-                pool.put(clientId, rehydrated);
+            if (queueRepository.containsQueue(session.clientId())) {
+                final SessionMessageQueue<EnqueuedMessage> persistentQueue = queueRepository.getOrCreateQueue(session.clientId());
+                queues.remove(session.clientId());
+                Session rehydrated = new Session(session, false, persistentQueue);
+                pool.put(session.clientId(), rehydrated);
             }
+        }
+        if (!queues.isEmpty()) {
+            LOG.error("Recreating sessions left {} unused queues. This is probably bug. Session IDs: {}", queues.size(), Arrays.toString(queues.toArray()));
         }
     }
 
     SessionCreationResult createOrReopenSession(MqttConnectMessage msg, String clientId, String username) {
         SessionCreationResult postConnectAction;
-        final Session newSession = createNewSession(msg, clientId);
-        final Session oldSession = pool.get(clientId);
+        final Session oldSession = retrieve(clientId);
         if (oldSession == null) {
-            // case 1
+            // case 1, no existing session with given clientId.
+            final Session newSession = createNewSession(msg, clientId);
             postConnectAction = new SessionCreationResult(newSession, CreationModeEnum.CREATED_CLEAN_NEW, false);
 
             // publish the session
-            final Session previous = pool.putIfAbsent(clientId, newSession);
-            final boolean success = previous == null;
-
-            if (success) {
-                LOG.trace("case 1, not existing session with CId {}", clientId);
-            } else {
-                postConnectAction = reopenExistingSession(msg, clientId, previous, newSession, username);
+            final Session previous = pool.put(clientId, newSession);
+            if (previous != null) {
+                // if this happens mean that another Session Event Loop thread processed a CONNECT message
+                // with the same clientId. This is a bug because all messages for the same clientId should
+                // be handled by the same event loop thread.
+                LOG.error("Another thread added a Session for our clientId {}, this is a bug!", clientId);
             }
+
+            LOG.trace("case 1, not existing session with CId {}", clientId);
         } else {
-            postConnectAction = reopenExistingSession(msg, clientId, oldSession, newSession, username);
+            postConnectAction = reopenExistingSession(msg, clientId, oldSession, username);
         }
         return postConnectAction;
     }
 
     private SessionCreationResult reopenExistingSession(MqttConnectMessage msg, String clientId,
-                                                        Session oldSession, Session newSession, String username) {
+                                                        Session oldSession, String username) {
         final boolean newIsClean = msg.variableHeader().isCleanSession();
         final SessionCreationResult creationResult;
-        if (oldSession.disconnected()) {
-            if (newIsClean) {
-                boolean result = oldSession.assignState(SessionStatus.DISCONNECTED, SessionStatus.CONNECTING);
-                if (!result) {
-                    throw new SessionCorruptedException("old session was already changed state");
-                }
-
-                // case 2
-                // publish new session
-                dropQueuesForClient(clientId);
-                unsubscribe(oldSession);
-                copySessionConfig(msg, oldSession);
-
-                LOG.trace("case 2, oldSession with same CId {} disconnected", clientId);
-                creationResult = new SessionCreationResult(oldSession, CreationModeEnum.CREATED_CLEAN_NEW, true);
-            } else {
-                final boolean connecting = oldSession.assignState(SessionStatus.DISCONNECTED, SessionStatus.CONNECTING);
-                if (!connecting) {
-                    throw new SessionCorruptedException("old session moved in connected state by other thread");
-                }
-                // case 3
-                reactivateSubscriptions(oldSession, username);
-
-                LOG.trace("case 3, oldSession with same CId {} disconnected", clientId);
-                creationResult = new SessionCreationResult(oldSession, CreationModeEnum.REOPEN_EXISTING, true);
-            }
-        } else {
-            // case 4
-            LOG.trace("case 4, oldSession with same CId {} still connected, force to close", clientId);
+        if (!oldSession.disconnected()) {
             oldSession.closeImmediately();
-            //remove(clientId);
-            creationResult = new SessionCreationResult(newSession, CreationModeEnum.DROP_EXISTING, true);
         }
 
-        if (creationResult.mode == CreationModeEnum.DROP_EXISTING) {
-            LOG.debug("Drop session of already connected client with same id");
-            if (!pool.replace(clientId, oldSession, newSession)) {
-                //the other client was disconnecting and removed it's own session
-                pool.put(clientId, newSession);
-            }
+        if (newIsClean) {
+            // case 2, reopening existing session but with a clean session
+            purgeSessionState(oldSession);
+            // publish new session
+            final Session newSession = createNewSession(msg, clientId);
+            pool.put(clientId, newSession);
+
+            LOG.trace("case 2, oldSession with same CId {} disconnected", clientId);
+            creationResult = new SessionCreationResult(newSession, CreationModeEnum.CREATED_CLEAN_NEW, true);
         } else {
-            LOG.debug("Replace session of client with same id");
-            if (!pool.replace(clientId, oldSession, oldSession)) {
-                throw new SessionCorruptedException("old session was already removed");
+            final boolean connecting = oldSession.assignState(SessionStatus.DISCONNECTED, SessionStatus.CONNECTING);
+            if (!connecting) {
+                throw new SessionCorruptedException("old session moved in connected state by other thread");
             }
+            // case 3, reopening existing session not clean session, so keep the existing subscriptions
+            copySessionConfig(msg, oldSession);
+            reactivateSubscriptions(oldSession, username);
+
+            LOG.trace("case 3, oldSession with same CId {} disconnected", clientId);
+            creationResult = new SessionCreationResult(oldSession, CreationModeEnum.REOPEN_EXISTING, true);
         }
 
         // case not covered new session is clean true/false and old session not in CONNECTED/DISCONNECTED
@@ -188,17 +227,26 @@ public class SessionRegistry {
 
     private Session createNewSession(MqttConnectMessage msg, String clientId) {
         final boolean clean = msg.variableHeader().isCleanSession();
-        final Queue<EnqueuedMessage> sessionQueue =
-                    queues.computeIfAbsent(clientId, (String cli) -> queueRepository.createQueue(cli, clean));
         final Session newSession;
+        final SessionMessageQueue<EnqueuedMessage> queue;
+        if (!clean) {
+            queue = queueRepository.getOrCreateQueue(clientId);
+        } else {
+            queue = new InMemoryQueue();
+        }
+        // in MQTT3 cleanSession = true means  expiryInterval=0 else infinite
+        final int expiryInterval = clean ? 0 : INFINITE_EXPIRY;
+        final ISessionsRepository.SessionData sessionData = new ISessionsRepository.SessionData(clientId,
+            MqttVersion.MQTT_3_1_1, expiryInterval);
         if (msg.variableHeader().isWillFlag()) {
             final Session.Will will = createWill(msg);
-            newSession = new Session(clientId, clean, will, sessionQueue);
+            newSession = new Session(sessionData, clean, will, queue);
         } else {
-            newSession = new Session(clientId, clean, sessionQueue);
+            newSession = new Session(sessionData, clean, queue);
         }
 
         newSession.markConnecting();
+        sessionsRepository.saveSession(sessionData);
         return newSession;
     }
 
@@ -225,12 +273,33 @@ public class SessionRegistry {
         return pool.get(clientID);
     }
 
-    public void remove(Session session) {
-        pool.remove(session.getClientID(), session);
+    void connectionClosed(Session session) {
+        session.disconnect();
+        if (session.expireImmediately()) {
+            purgeSessionState(session);
+            return;
+        } else {
+            // TODO if binded session has expiry, disconnect it and schedule a task to do the cleanup after that
+
+        }
     }
 
-    private void dropQueuesForClient(String clientId) {
-        queues.remove(clientId);
+    private void purgeSessionState(Session session) {
+        LOG.debug("Remove session state for client {}", session.getClientID());
+        boolean result = session.assignState(SessionStatus.DISCONNECTED, SessionStatus.DESTROYED);
+        if (!result) {
+            throw new SessionCorruptedException("Session has already changed state: " + session);
+        }
+
+        unsubscribe(session);
+        remove(session.getClientID());
+    }
+
+    void remove(String clientID) {
+        final Session old = pool.remove(clientID);
+        if (old != null) {
+            old.cleanUp();
+        }
     }
 
     Collection<ClientDescriptor> listConnectedClients() {
@@ -246,5 +315,12 @@ public class SessionRegistry {
         final String clientID = s.getClientID();
         final Optional<InetSocketAddress> remoteAddressOpt = s.remoteAddress();
         return remoteAddressOpt.map(r -> new ClientDescriptor(clientID, r.getHostString(), r.getPort()));
+    }
+
+    /**
+     * Close all resources related to session management
+     * */
+    public void close() {
+        queueRepository.close();
     }
 }

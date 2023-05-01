@@ -39,7 +39,12 @@ import org.junit.jupiter.api.Test;
 import java.nio.charset.Charset;
 import java.util.Collections;
 import java.util.Set;
+import java.util.concurrent.ExecutionException;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.TimeoutException;
 
+import static io.moquette.broker.MQTTConnectionPublishTest.memorySessionsRepository;
+import static io.moquette.BrokerConstants.NO_BUFFER_FLUSH;
 import static io.moquette.broker.PostOfficePublishTest.PUBLISHER_ID;
 import static io.netty.handler.codec.mqtt.MqttQoS.AT_LEAST_ONCE;
 import static io.netty.handler.codec.mqtt.MqttQoS.AT_MOST_ONCE;
@@ -65,7 +70,7 @@ public class PostOfficeUnsubscribeTest {
     private MqttConnectMessage connectMessage;
     private IAuthenticator mockAuthenticator;
     private SessionRegistry sessionRegistry;
-    public static final BrokerConfiguration CONFIG = new BrokerConfiguration(true, true, false, false);
+    public static final BrokerConfiguration CONFIG = new BrokerConfiguration(true, true, false, NO_BUFFER_FLUSH);
     private MemoryQueueRepository queueRepository;
 
     @BeforeEach
@@ -93,23 +98,19 @@ public class PostOfficeUnsubscribeTest {
 
         final PermitAllAuthorizatorPolicy authorizatorPolicy = new PermitAllAuthorizatorPolicy();
         final Authorizator permitAll = new Authorizator(authorizatorPolicy);
-        sessionRegistry = new SessionRegistry(subscriptions, queueRepository, permitAll);
+        sessionRegistry = new SessionRegistry(subscriptions, memorySessionsRepository(), queueRepository, permitAll);
+        final SessionEventLoopGroup loopsGroup = new SessionEventLoopGroup(ConnectionTestUtils.NO_OBSERVERS_INTERCEPTOR, 1024);
         sut = new PostOffice(subscriptions, new MemoryRetainedRepository(), sessionRegistry,
-                             ConnectionTestUtils.NO_OBSERVERS_INTERCEPTOR, permitAll);
+                             ConnectionTestUtils.NO_OBSERVERS_INTERCEPTOR, permitAll, loopsGroup);
     }
 
     private MQTTConnection createMQTTConnection(BrokerConfiguration config, Channel channel) {
         return new MQTTConnection(channel, config, mockAuthenticator, null, sessionRegistry, sut);
     }
 
-    protected void connect(MQTTConnection connection, String clientId) {
+    protected static void connect(MQTTConnection connection, String clientId) {
         MqttConnectMessage connectMessage = ConnectionTestUtils.buildConnect(clientId);
-        connect(connection, connectMessage);
-    }
-
-    protected void connect(MQTTConnection connection, MqttConnectMessage connectMessage) {
-        connection.processConnect(connectMessage);
-        ConnectionTestUtils.assertConnectAccepted((EmbeddedChannel) connection.channel);
+        ConnectionTestUtils.connect(connection, connectMessage);
     }
 
     protected void subscribe(MQTTConnection connection, String topic, MqttQoS desiredQos) {
@@ -147,7 +148,7 @@ public class PostOfficeUnsubscribeTest {
     }
 
     @Test
-    public void testDontNotifyClientSubscribedToTopicAfterDisconnectedAndReconnectOnSameChannel() {
+    public void testDontNotifyClientSubscribedToTopicAfterDisconnectedAndReconnectOnSameChannel() throws ExecutionException, InterruptedException, TimeoutException {
         connect(this.connection, FAKE_CLIENT_ID);
         subscribe(connection, NEWS_TOPIC, AT_MOST_ONCE);
 
@@ -158,7 +159,7 @@ public class PostOfficeUnsubscribeTest {
                 .payload(payload.retainedDuplicate())
                 .qos(MqttQoS.AT_MOST_ONCE)
                 .retained(false)
-                .topicName(NEWS_TOPIC).build());
+                .topicName(NEWS_TOPIC).build()).get(5, TimeUnit.SECONDS);
 
         ConnectionTestUtils.verifyPublishIsReceived(channel, AT_MOST_ONCE, "Hello world!");
 
@@ -186,7 +187,7 @@ public class PostOfficeUnsubscribeTest {
     }
 
     @Test
-    public void testDontNotifyClientSubscribedToTopicAfterDisconnectedAndReconnectOnNewChannel() {
+    public void testDontNotifyClientSubscribedToTopicAfterDisconnectedAndReconnectOnNewChannel() throws ExecutionException, InterruptedException, TimeoutException {
         connect(this.connection, FAKE_CLIENT_ID);
         subscribe(connection, NEWS_TOPIC, AT_MOST_ONCE);
         // publish on /news
@@ -196,7 +197,7 @@ public class PostOfficeUnsubscribeTest {
                 .payload(payload.retainedDuplicate())
                 .qos(MqttQoS.AT_MOST_ONCE)
                 .retained(false)
-                .topicName(NEWS_TOPIC).build());
+                .topicName(NEWS_TOPIC).build()).get(5, TimeUnit.SECONDS);
 
         ConnectionTestUtils.verifyPublishIsReceived(channel, AT_MOST_ONCE, "Hello world!");
 
@@ -206,7 +207,7 @@ public class PostOfficeUnsubscribeTest {
         // connect on another channel
         EmbeddedChannel anotherChannel = new EmbeddedChannel();
         MQTTConnection anotherConnection = createMQTTConnection(CONFIG, anotherChannel);
-        anotherConnection.processConnect(connectMessage);
+        anotherConnection.processConnect(connectMessage).completableFuture().get();
         ConnectionTestUtils.assertConnectAccepted(anotherChannel);
 
         // publish on /news
@@ -222,9 +223,9 @@ public class PostOfficeUnsubscribeTest {
     }
 
     @Test
-    public void avoidMultipleNotificationsAfterMultipleReconnection_cleanSessionFalseQoS1() {
+    public void avoidMultipleNotificationsAfterMultipleReconnection_cleanSessionFalseQoS1() throws ExecutionException, InterruptedException {
         final MqttConnectMessage notCleanConnect = ConnectionTestUtils.buildConnectNotClean(FAKE_CLIENT_ID);
-        connect(connection, notCleanConnect);
+        ConnectionTestUtils.connect(connection, notCleanConnect);
         subscribe(connection, NEWS_TOPIC, AT_LEAST_ONCE);
         connection.processDisconnect(null);
 
@@ -235,7 +236,7 @@ public class PostOfficeUnsubscribeTest {
         // reconnect FAKE_CLIENT on another channel
         EmbeddedChannel anotherChannel2 = new EmbeddedChannel();
         MQTTConnection anotherConnection2 = createMQTTConnection(CONFIG, anotherChannel2);
-        anotherConnection2.processConnect(notCleanConnect);
+        anotherConnection2.processConnect(notCleanConnect).completableFuture().get();
         ConnectionTestUtils.assertConnectAccepted(anotherChannel2);
 
         ConnectionTestUtils.verifyPublishIsReceived(anotherChannel2, MqttQoS.AT_LEAST_ONCE, firstPayload);
@@ -247,7 +248,7 @@ public class PostOfficeUnsubscribeTest {
 
         EmbeddedChannel anotherChannel3 = new EmbeddedChannel();
         MQTTConnection anotherConnection3 = createMQTTConnection(CONFIG, anotherChannel3);
-        anotherConnection3.processConnect(notCleanConnect);
+        anotherConnection3.processConnect(notCleanConnect).completableFuture().get();
         ConnectionTestUtils.assertConnectAccepted(anotherChannel3);
 
         ConnectionTestUtils.verifyPublishIsReceived(anotherChannel3, MqttQoS.AT_LEAST_ONCE, secondPayload);
@@ -272,21 +273,19 @@ public class PostOfficeUnsubscribeTest {
     private MQTTConnection connectNotCleanAs(String clientId) {
         EmbeddedChannel channel = new EmbeddedChannel();
         MQTTConnection connection = createMQTTConnection(CONFIG, channel);
-        connection.processConnect(ConnectionTestUtils.buildConnectNotClean(clientId));
-        ConnectionTestUtils.assertConnectAccepted(channel);
+        ConnectionTestUtils.connect(connection, ConnectionTestUtils.buildConnectNotClean(clientId));
         return connection;
     }
 
     private MQTTConnection connectAs(String clientId) {
         EmbeddedChannel channel = new EmbeddedChannel();
         MQTTConnection connection = createMQTTConnection(CONFIG, channel);
-        connection.processConnect(ConnectionTestUtils.buildConnect(clientId));
-        ConnectionTestUtils.assertConnectAccepted(channel);
+        ConnectionTestUtils.connect(connection, ConnectionTestUtils.buildConnect(clientId));
         return connection;
     }
 
     @Test
-    public void testConnectSubPub_cycle_getTimeout_on_second_disconnect_issue142() {
+    public void testConnectSubPub_cycle_getTimeout_on_second_disconnect_issue142() throws ExecutionException, InterruptedException, TimeoutException {
         connect(connection, FAKE_CLIENT_ID);
         subscribe(connection, NEWS_TOPIC, AT_MOST_ONCE);
         // publish on /news
@@ -296,7 +295,7 @@ public class PostOfficeUnsubscribeTest {
                 .payload(payload.retainedDuplicate())
                 .qos(MqttQoS.AT_MOST_ONCE)
                 .retained(false)
-                .topicName(NEWS_TOPIC).build());
+                .topicName(NEWS_TOPIC).build()).get(5, TimeUnit.SECONDS);
 
         ConnectionTestUtils.verifyPublishIsReceived((EmbeddedChannel) connection.channel, AT_MOST_ONCE, "Hello world!");
 
@@ -305,7 +304,7 @@ public class PostOfficeUnsubscribeTest {
         final MqttConnectMessage notCleanConnect = ConnectionTestUtils.buildConnect(FAKE_CLIENT_ID);
         EmbeddedChannel subscriberChannel = new EmbeddedChannel();
         MQTTConnection subscriberConnection = createMQTTConnection(CONFIG, subscriberChannel);
-        subscriberConnection.processConnect(notCleanConnect);
+        subscriberConnection.processConnect(notCleanConnect).completableFuture().get();
         ConnectionTestUtils.assertConnectAccepted(subscriberChannel);
 
         subscribe(subscriberConnection, NEWS_TOPIC, AT_MOST_ONCE);
@@ -316,17 +315,17 @@ public class PostOfficeUnsubscribeTest {
                 .payload(payload2.retainedDuplicate())
                 .qos(MqttQoS.AT_MOST_ONCE)
                 .retained(false)
-                .topicName(NEWS_TOPIC).build());
+                .topicName(NEWS_TOPIC).build()).get(5, TimeUnit.SECONDS);
 
         ConnectionTestUtils.verifyPublishIsReceived(subscriberChannel, AT_MOST_ONCE, "Hello world2!");
 
-        subscriberConnection.processDisconnect(null);
+        subscriberConnection.processDisconnect(null).completableFuture().get();
 
         assertFalse(subscriberChannel.isOpen(), "after a disconnect the client should be disconnected");
     }
 
     @Test
-    public void checkReplayofStoredPublishResumeAfter_a_disconnect_cleanSessionFalseQoS1() {
+    public void checkReplayofStoredPublishResumeAfter_a_disconnect_cleanSessionFalseQoS1() throws ExecutionException, InterruptedException {
         final MQTTConnection publisher = connectAs("Publisher");
 
         connect(this.connection, FAKE_CLIENT_ID);
@@ -335,7 +334,7 @@ public class PostOfficeUnsubscribeTest {
         // publish from another channel
         publishQos1(publisher, NEWS_TOPIC, "Hello world MQTT!!-1", 99);
         ConnectionTestUtils.verifyPublishIsReceived(channel, AT_LEAST_ONCE, "Hello world MQTT!!-1");
-        connection.processDisconnect(null);
+        connection.processDisconnect(null).completableFuture().get();
 
         publishQos1(publisher, NEWS_TOPIC, "Hello world MQTT!!-2", 100);
         publishQos1(publisher, NEWS_TOPIC, "Hello world MQTT!!-3", 101);
@@ -348,12 +347,16 @@ public class PostOfficeUnsubscribeTest {
 
     private void publishQos1(MQTTConnection publisher, String topic, String payload, int messageID) {
         final ByteBuf bytePayload = Unpooled.copiedBuffer(payload, Charset.defaultCharset());
-        sut.receivedPublishQos1(publisher, new Topic(topic), TEST_USER, messageID,
-            MqttMessageBuilders.publish()
-                .payload(bytePayload)
-                .qos(MqttQoS.AT_LEAST_ONCE)
-                .retained(false)
-                .topicName(NEWS_TOPIC).build());
+        try {
+            sut.receivedPublishQos1(publisher, new Topic(topic), TEST_USER, messageID,
+                MqttMessageBuilders.publish()
+                    .payload(bytePayload)
+                    .qos(MqttQoS.AT_LEAST_ONCE)
+                    .retained(false)
+                    .topicName(NEWS_TOPIC).build()).completableFuture().get(5, TimeUnit.SECONDS);
+        } catch (InterruptedException | ExecutionException | TimeoutException e) {
+            throw new RuntimeException(e);
+        }
     }
 
     private void publishQos2(MQTTConnection connection, String topic, String payload) {
@@ -362,6 +365,7 @@ public class PostOfficeUnsubscribeTest {
             .payload(bytePayload)
             .qos(MqttQoS.EXACTLY_ONCE)
             .retained(true)
+            .messageId(1)
             .topicName(topic).build(), "username");
     }
 
@@ -372,7 +376,7 @@ public class PostOfficeUnsubscribeTest {
      */
     @Test
     public void checkQoS2SubscriberDisconnectReceivePersistedPublishes() {
-        connect(this.connection, FAKE_CLIENT_ID);
+        connect(connection, FAKE_CLIENT_ID);
         subscribe(connection, NEWS_TOPIC, EXACTLY_ONCE);
         connection.processDisconnect(null);
 
@@ -391,7 +395,7 @@ public class PostOfficeUnsubscribeTest {
      * message "hello" on "a/b" subscriber must receive only a single message not twice
      */
     @Test
-    public void checkSinglePublishOnOverlappingSubscriptions() {
+    public void checkSinglePubPostOfficeUnsubscribeTestlishOnOverlappingSubscriptions() {
         final MQTTConnection publisher = connectAs("Publisher");
 
         connect(this.connection, FAKE_CLIENT_ID);

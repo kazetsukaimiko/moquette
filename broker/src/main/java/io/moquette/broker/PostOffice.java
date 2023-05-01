@@ -20,12 +20,22 @@ import io.moquette.interception.BrokerInterceptor;
 import io.netty.buffer.ByteBuf;
 import io.netty.buffer.Unpooled;
 import io.netty.handler.codec.mqtt.*;
+import io.netty.util.ReferenceCountUtil;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 import java.util.ArrayList;
+import java.util.Collection;
+import java.util.Collections;
+import java.util.HashSet;
 import java.util.List;
+import java.util.Objects;
 import java.util.Set;
+import java.util.concurrent.Callable;
+import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.ConcurrentMap;
+import java.util.function.Consumer;
 import java.util.stream.Collectors;
 
 import static io.moquette.broker.Utils.messageId;
@@ -34,21 +44,152 @@ import static io.netty.handler.codec.mqtt.MqttQoS.*;
 
 class PostOffice {
 
+    /**
+     * Maps the failed packetID per clientId (id client source, id_packet) -> [id client target]
+     * */
+    private static class FailedPublishCollection {
+
+        static class PacketId {
+
+            private final String clientId;
+            private final int idPacket;
+
+            PacketId(String clientId, int idPacket) {
+                this.clientId = clientId;
+                this.idPacket = idPacket;
+            }
+            @Override
+            public boolean equals(Object o) {
+                if (this == o) return true;
+                if (o == null || getClass() != o.getClass()) return false;
+                PacketId packetId = (PacketId) o;
+                return idPacket == packetId.idPacket && Objects.equals(clientId, packetId.clientId);
+            }
+
+            @Override
+            public int hashCode() {
+                return Objects.hash(clientId, idPacket);
+            }
+
+            public boolean belongToClient(String clientId) {
+                return this.clientId.equals(clientId);
+            }
+        }
+
+        private final ConcurrentMap<PacketId, Set<String>> packetsMap = new ConcurrentHashMap<>();
+
+        private void insert(String clientId, int messageID, String failedClientId) {
+            final PacketId packetId = new PacketId(clientId, messageID);
+            packetsMap.computeIfAbsent(packetId, k -> new HashSet<>())
+                .add(failedClientId);
+        }
+
+        public void remove(String clientId, int messageID, String targetClientId) {
+            final PacketId packetId = new PacketId(clientId, messageID);
+            packetsMap.computeIfPresent(packetId, (key, clientsSet) -> {
+               clientsSet.remove(targetClientId);
+               if (clientsSet.isEmpty()) {
+                   // the mapping key, value is removed
+                   return null;
+               } else {
+                   return clientsSet;
+               }
+            });
+        }
+
+        private void removeAll(int messageID, String clientId, Collection<String> routings) {
+            for (String targetClientId : routings) {
+                remove(clientId, messageID, targetClientId);
+            }
+        }
+
+        void cleanupForClient(String clientId) {
+            // the only way to linear scan the map to collect of PacketIds references,
+            // for a following step of cleaning
+            packetsMap.keySet().stream()
+                .filter(packet -> packet.belongToClient(clientId))
+                .forEach(packetsMap::remove);
+        }
+
+        void insertAll(int messageID, String clientId, Collection<String> routings) {
+            for (String targetClientId : routings) {
+                insert(clientId, messageID, targetClientId);
+            }
+        }
+
+        Set<String> listFailed(String clientId, int messageID) {
+            final PacketId packetId = new PacketId(clientId, messageID);
+            return packetsMap.getOrDefault(packetId, Collections.emptySet());
+        }
+    }
+
+    static class RouteResult {
+        private final String clientId;
+        private final Status status;
+        private CompletableFuture queuedFuture;
+
+        enum Status {SUCCESS, FAIL}
+
+        public static RouteResult success(String clientId, CompletableFuture queuedFuture) {
+            return new RouteResult(clientId, Status.SUCCESS, queuedFuture);
+        }
+
+        public static RouteResult failed(String clientId) {
+            return failed(clientId, null);
+        }
+
+        public static RouteResult failed(String clientId, String error) {
+           final CompletableFuture<Void> failed = new CompletableFuture<>();
+            failed.completeExceptionally(new Error(error));
+            return new RouteResult(clientId, Status.FAIL, failed);
+        }
+
+        private RouteResult(String clientId, Status status, CompletableFuture queuedFuture) {
+            this.clientId = clientId;
+            this.status = status;
+            this.queuedFuture = queuedFuture;
+        }
+
+        public CompletableFuture completableFuture() {
+            if (status == Status.FAIL) {
+                throw new IllegalArgumentException("Accessing completable future on a failed result");
+            }
+            return queuedFuture;
+        }
+
+        public boolean isSuccess() {
+            return status == Status.SUCCESS;
+        }
+
+        public RouteResult ifFailed(Runnable action) {
+            if (!isSuccess()) {
+                action.run();
+            }
+            return this;
+        }
+    }
+
     private static final Logger LOG = LoggerFactory.getLogger(PostOffice.class);
+
+    private static final Set<String> NO_FILTER = new HashSet<>();
 
     private final Authorizator authorizator;
     private final ISubscriptionsDirectory subscriptions;
     private final IRetainedRepository retainedRepository;
     private SessionRegistry sessionRegistry;
     private BrokerInterceptor interceptor;
+    private final FailedPublishCollection failedPublishes = new FailedPublishCollection();
+    private final SessionEventLoopGroup sessionLoops;
 
     PostOffice(ISubscriptionsDirectory subscriptions, IRetainedRepository retainedRepository,
-               SessionRegistry sessionRegistry, BrokerInterceptor interceptor, Authorizator authorizator) {
+               SessionRegistry sessionRegistry, BrokerInterceptor interceptor, Authorizator authorizator,
+               SessionEventLoopGroup sessionLoops) {
         this.authorizator = authorizator;
         this.subscriptions = subscriptions;
         this.retainedRepository = retainedRepository;
         this.sessionRegistry = sessionRegistry;
         this.interceptor = interceptor;
+        this.sessionLoops = sessionLoops;
     }
 
     public void init(SessionRegistry sessionRegistry) {
@@ -133,6 +274,13 @@ class PostOffice {
     public void unsubscribe(List<String> topics, MQTTConnection mqttConnection, int messageId) {
         final String clientID = mqttConnection.getClientId();
         final Session session = sessionRegistry.retrieve(clientID);
+        if (session == null) {
+            // Session is already destroyed.
+            // Just ack the client
+            LOG.warn("Session not found when unsubscribing {}", clientID);
+            mqttConnection.sendUnsubAckMessage(topics, clientID, messageId);
+            return;
+        }
         for (String t : topics) {
             Topic topic = new Topic(t);
             boolean validTopic = topic.isValid();
@@ -156,102 +304,260 @@ class PostOffice {
         mqttConnection.sendUnsubAckMessage(topics, clientID, messageId);
     }
 
-    void receivedPublishQos0(Topic topic, String username, String clientID, MqttPublishMessage msg) {
+    CompletableFuture<Void> receivedPublishQos0(Topic topic, String username, String clientID, MqttPublishMessage msg) {
         if (!authorizator.canWrite(topic, username, clientID)) {
             LOG.error("client is not authorized to publish on topic: {}", topic);
-            return;
+            ReferenceCountUtil.release(msg);
+            return CompletableFuture.completedFuture(null);
         }
-        publish2Subscribers(msg.payload(), topic, AT_MOST_ONCE);
-
-        if (msg.fixedHeader().isRetain()) {
-            // QoS == 0 && retain => clean old retained
-            retainedRepository.cleanRetained(topic);
+        final RoutingResults publishResult = publish2Subscribers(msg.payload(), topic, AT_MOST_ONCE);
+        if (publishResult.isAllFailed()) {
+            LOG.info("No one publish was successfully enqueued to session loops");
+            ReferenceCountUtil.release(msg);
+            return CompletableFuture.completedFuture(null);
         }
 
-        interceptor.notifyTopicPublished(msg, clientID, username);
+        return publishResult.completableFuture().thenRun(() -> {
+            if (msg.fixedHeader().isRetain()) {
+                // QoS == 0 && retain => clean old retained
+                retainedRepository.cleanRetained(topic);
+            }
+
+            interceptor.notifyTopicPublished(msg, clientID, username);
+            ReferenceCountUtil.release(msg);
+        });
     }
 
-    void receivedPublishQos1(MQTTConnection connection, Topic topic, String username, int messageID,
-                             MqttPublishMessage msg) {
-        // verify if topic can be write
+    RoutingResults receivedPublishQos1(MQTTConnection connection, Topic topic, String username, int messageID,
+                                                MqttPublishMessage msg) {
+        // verify if topic can be written
         topic.getTokens();
         if (!topic.isValid()) {
             LOG.warn("Invalid topic format, force close the connection");
             connection.dropConnection();
-            return;
+            ReferenceCountUtil.release(msg);
+            return RoutingResults.preroutingError();
         }
         final String clientId = connection.getClientId();
         if (!authorizator.canWrite(topic, username, clientId)) {
             LOG.error("MQTT client: {} is not authorized to publish on topic: {}", clientId, topic);
-            return;
+            ReferenceCountUtil.release(msg);
+            return RoutingResults.preroutingError();
         }
 
         ByteBuf payload = msg.payload();
-        publish2Subscribers(payload, topic, AT_LEAST_ONCE);
+        final RoutingResults routes;
+        if (msg.fixedHeader().isDup()) {
+            final Set<String> failedClients = failedPublishes.listFailed(clientId, messageID);
+            routes = publish2Subscribers(payload, topic, AT_LEAST_ONCE, failedClients);
+        } else {
+            routes = publish2Subscribers(payload, topic, AT_LEAST_ONCE);
+        }
+        if (LOG.isTraceEnabled()) {
+            LOG.trace("subscriber routes: {}", routes);
+        }
+        if (routes.isAllSuccess()) {
+            // QoS1 message was enqueued successfully to every event loop
+            connection.sendPubAck(messageID);
+            manageRetain(topic, msg);
+            interceptor.notifyTopicPublished(msg, clientId, username);
+        } else {
+            // some session event loop enqueue raised a problem
+            failedPublishes.insertAll(messageID, clientId, routes.failedRoutings);
+        }
+        ReferenceCountUtil.release(msg);
 
-        connection.sendPubAck(messageID);
+        // cleanup success resends from the failed publishes cache
+        failedPublishes.removeAll(messageID, clientId, routes.successedRoutings);
 
+        return routes;
+    }
+
+    private void manageRetain(Topic topic, MqttPublishMessage msg) {
         if (msg.fixedHeader().isRetain()) {
-            if (!payload.isReadable()) {
+            if (!msg.payload().isReadable()) {
                 retainedRepository.cleanRetained(topic);
             } else {
                 // before wasn't stored
                 retainedRepository.retain(topic, msg);
             }
         }
-        interceptor.notifyTopicPublished(msg, clientId, username);
     }
 
-    private void publish2Subscribers(ByteBuf payload, Topic topic, MqttQoS publishingQos) {
+    private RoutingResults publish2Subscribers(ByteBuf payload, Topic topic, MqttQoS publishingQos) {
+        return publish2Subscribers(payload, topic, publishingQos, NO_FILTER);
+    }
+
+    private class BatchingPublishesCollector {
+        final List<Subscription>[] subscriptions;
+        private final int eventLoops;
+        private final SessionEventLoopGroup loopGroup;
+
+        BatchingPublishesCollector(SessionEventLoopGroup loopGroup) {
+            eventLoops = loopGroup.getEventLoopCount();
+            this.loopGroup = loopGroup;
+            subscriptions = new List[eventLoops];
+        }
+
+        public void add(Subscription sub) {
+            final int targetQueueId = subscriberEventLoop(sub.getClientId());
+            if (subscriptions[targetQueueId] == null) {
+                subscriptions[targetQueueId] = new ArrayList<>();
+            }
+            subscriptions[targetQueueId].add(sub);
+        }
+
+        private int subscriberEventLoop(String clientId) {
+            return loopGroup.targetQueueOrdinal(clientId);
+        }
+
+        List<RouteResult> routeBatchedPublishes(Consumer<List<Subscription>> action) {
+            List<RouteResult> publishResults = new ArrayList<>(this.eventLoops);
+
+            for (List<Subscription> subscriptionsBatch : subscriptions) {
+                if (subscriptionsBatch == null) {
+                    continue;
+                }
+                final String clientId = subscriptionsBatch.get(0).getClientId();
+                if (LOG.isTraceEnabled()) {
+                    final String subscriptionsDetails = subscriptionsBatch.stream()
+                        .map(Subscription::toString)
+                        .collect(Collectors.joining(",\n"));
+                    final int loopId = subscriberEventLoop(clientId);
+                    LOG.trace("Routing PUBLISH to eventLoop {}  for subscriptions [{}]", loopId, subscriptionsDetails);
+                }
+                publishResults.add(routeCommand(clientId, "batched PUB", () -> {
+                    action.accept(subscriptionsBatch);
+                    return null;
+                }));
+            }
+            return publishResults;
+        }
+
+        Collection<String> subscriberIdsByEventLoop(String clientId) {
+            final int targetQueueId = subscriberEventLoop(clientId);
+            return subscriptions[targetQueueId].stream().map(Subscription::getClientId).collect(Collectors.toList());
+        }
+
+        public int countBatches() {
+            int count = 0;
+            for (List<Subscription> subscriptionsBatch : subscriptions) {
+                if (subscriptionsBatch == null) {
+                    continue;
+                }
+                count ++;
+            }
+            return count;
+        }
+    }
+
+    private RoutingResults publish2Subscribers(ByteBuf payload, Topic topic, MqttQoS publishingQos,
+                                               Set<String> filterTargetClients) {
         Set<Subscription> topicMatchingSubscriptions = subscriptions.matchQosSharpening(topic);
+        if (topicMatchingSubscriptions.isEmpty()) {
+            // no matching subscriptions, clean exit
+            LOG.trace("No matching subscriptions for topic: {}", topic);
+            return new RoutingResults(Collections.emptyList(), Collections.emptyList(), CompletableFuture.completedFuture(null));
+        }
+
+        final BatchingPublishesCollector collector = new BatchingPublishesCollector(sessionLoops);
 
         for (final Subscription sub : topicMatchingSubscriptions) {
-            MqttQoS qos = lowerQosToTheSubscriptionDesired(sub, publishingQos);
-            Session targetSession = this.sessionRegistry.retrieve(sub.getClientId());
-
-            boolean isSessionPresent = targetSession != null;
-            if (isSessionPresent) {
-                LOG.debug("Sending PUBLISH message to active subscriber CId: {}, topicFilter: {}, qos: {}",
-                          sub.getClientId(), sub.getTopicFilter(), qos);
-                targetSession.sendPublishOnSessionAtQos(topic, qos, payload);
-            } else {
-                // If we are, the subscriber disconnected after the subscriptions tree selected that session as a
-                // destination.
-                LOG.debug("PUBLISH to not yet present session. CId: {}, topicFilter: {}, qos: {}", sub.getClientId(),
-                          sub.getTopicFilter(), qos);
+            if (filterTargetClients == NO_FILTER || filterTargetClients.contains(sub.getClientId())) {
+                collector.add(sub);
             }
+        }
+        payload.retain(collector.countBatches());
+
+        List<RouteResult> publishResults = collector.routeBatchedPublishes((batch) -> {
+            publishToSession(payload, topic, batch, publishingQos);
+            payload.release();
+        });
+
+        final CompletableFuture[] publishFutures = publishResults.stream()
+            .filter(RouteResult::isSuccess)
+            .map(RouteResult::completableFuture).toArray(CompletableFuture[]::new);
+        final CompletableFuture<Void> publishes = CompletableFuture.allOf(publishFutures);
+
+        final List<String> failedRoutings = new ArrayList<>();
+        final List<String> successedRoutings = new ArrayList<>();
+        for (RouteResult rr : publishResults) {
+            Collection<String> subscibersIds = collector.subscriberIdsByEventLoop(rr.clientId);
+            if (rr.status == RouteResult.Status.FAIL) {
+                failedRoutings.addAll(subscibersIds);
+                payload.release();
+            } else {
+                successedRoutings.addAll(subscibersIds);
+            }
+        }
+        return new RoutingResults(successedRoutings, failedRoutings, publishes);
+    }
+
+    private void publishToSession(ByteBuf payload, Topic topic, Collection<Subscription> subscriptions, MqttQoS publishingQos) {
+        ByteBuf duplicate = payload.duplicate();
+        for (Subscription sub : subscriptions) {
+            MqttQoS qos = lowerQosToTheSubscriptionDesired(sub, publishingQos);
+            publishToSession(duplicate, topic, sub, qos);
+        }
+    }
+
+    private void publishToSession(ByteBuf payload, Topic topic, Subscription sub, MqttQoS qos) {
+        Session targetSession = this.sessionRegistry.retrieve(sub.getClientId());
+
+        boolean isSessionPresent = targetSession != null;
+        if (isSessionPresent) {
+            LOG.debug("Sending PUBLISH message to active subscriber CId: {}, topicFilter: {}, qos: {}",
+                      sub.getClientId(), sub.getTopicFilter(), qos);
+            targetSession.sendNotRetainedPublishOnSessionAtQos(topic, qos, payload);
+        } else {
+            // If we are, the subscriber disconnected after the subscriptions tree selected that session as a
+            // destination.
+            LOG.debug("PUBLISH to not yet present session. CId: {}, topicFilter: {}, qos: {}", sub.getClientId(),
+                      sub.getTopicFilter(), qos);
         }
     }
 
     /**
      * First phase of a publish QoS2 protocol, sent by publisher to the broker. Publish to all interested
      * subscribers.
+     * @return
      */
-    void receivedPublishQos2(MQTTConnection connection, MqttPublishMessage mqttPublishMessage, String username) {
-        LOG.trace("Processing PUBREL message on connection: {}", connection);
-        final Topic topic = new Topic(mqttPublishMessage.variableHeader().topicName());
-        final ByteBuf payload = mqttPublishMessage.payload();
+    RoutingResults receivedPublishQos2(MQTTConnection connection, MqttPublishMessage msg, String username) {
+        LOG.trace("Processing PUB QoS2 message on connection: {}", connection);
+        final Topic topic = new Topic(msg.variableHeader().topicName());
+        final ByteBuf payload = msg.payload();
 
         final String clientId = connection.getClientId();
         if (!authorizator.canWrite(topic, username, clientId)) {
             LOG.error("MQTT client is not authorized to publish on topic: {}", topic);
-            return;
+            ReferenceCountUtil.release(msg);
+            // WARN this is a special case failed is empty, but this result is to be considered as error.
+            return RoutingResults.preroutingError();
         }
 
-        publish2Subscribers(payload, topic, EXACTLY_ONCE);
-
-        final boolean retained = mqttPublishMessage.fixedHeader().isRetain();
-        if (retained) {
-            if (!payload.isReadable()) {
-                retainedRepository.cleanRetained(topic);
-            } else {
-                // before wasn't stored
-                retainedRepository.retain(topic, mqttPublishMessage);
-            }
+        final int messageID = msg.variableHeader().packetId();
+        final RoutingResults publishRoutings;
+        if (msg.fixedHeader().isDup()) {
+            final Set<String> failedClients = failedPublishes.listFailed(clientId, messageID);
+            publishRoutings = publish2Subscribers(payload, topic, EXACTLY_ONCE, failedClients);
+        } else {
+            publishRoutings = publish2Subscribers(payload, topic, EXACTLY_ONCE);
         }
+        if (publishRoutings.isAllSuccess()) {
+            // QoS2 PUB message was enqueued successfully to every event loop
+            connection.sendPubRec(messageID);
+            manageRetain(topic, msg);
+            interceptor.notifyTopicPublished(msg, clientId, username);
+        } else {
+            // some session event loop enqueue raised a problem
+            failedPublishes.insertAll(messageID, clientId, publishRoutings.failedRoutings);
+        }
+        ReferenceCountUtil.release(msg);
 
-        String clientID = connection.getClientId();
-        interceptor.notifyTopicPublished(mqttPublishMessage, clientID, username);
+        // cleanup success resends from the failed publishes cache
+        failedPublishes.removeAll(messageID, clientId, publishRoutings.successedRoutings);
+
+        return publishRoutings;
     }
 
     static MqttQoS lowerQosToTheSubscriptionDesired(Subscription sub, MqttQoS qos) {
@@ -270,24 +576,28 @@ class PostOffice {
      *
      * @param msg
      *            the message to publish
+     * @return
+     *            the result of the enqueuing operation to session loops.
      */
-    public void internalPublish(MqttPublishMessage msg) {
+    public RoutingResults internalPublish(MqttPublishMessage msg) {
         final MqttQoS qos = msg.fixedHeader().qosLevel();
         final Topic topic = new Topic(msg.variableHeader().topicName());
         final ByteBuf payload = msg.payload();
         LOG.info("Sending internal PUBLISH message Topic={}, qos={}", topic, qos);
 
-        publish2Subscribers(payload, topic, qos);
+        final RoutingResults publishResult = publish2Subscribers(payload, topic, qos);
+        LOG.trace("after routed publishes: {}", publishResult);
 
         if (!msg.fixedHeader().isRetain()) {
-            return;
+            return publishResult;
         }
         if (qos == AT_MOST_ONCE || payload.readableBytes() == 0) {
             // QoS == 0 && retain => clean old retained
             retainedRepository.cleanRetained(topic);
-            return;
+            return publishResult;
         }
         retainedRepository.retain(topic, msg);
+        return publishResult;
     }
 
     /**
@@ -306,8 +616,26 @@ class PostOffice {
         interceptor.notifyClientConnectionLost(clientId, userName);
     }
 
-//    void flushInFlight(MQTTConnection mqttConnection) {
-//        Session targetSession = sessionRegistry.retrieve(mqttConnection.getClientId());
-//        targetSession.flushAllQueuedMessages();
-//    }
+    String sessionLoopThreadName(String clientId) {
+        return sessionLoops.sessionLoopThreadName(clientId);
+    }
+
+    /**
+     * Route the command to the owning SessionEventLoop
+     * */
+    public RouteResult routeCommand(String clientId, String actionDescription, Callable<String> action) {
+        return sessionLoops.routeCommand(clientId, actionDescription, action);
+    }
+
+    public void terminate() {
+        sessionLoops.terminate();
+    }
+
+    /**
+     * Clean up all the data related to the specified client;
+     * */
+    public void clientDisconnected(String clientID, String userName) {
+        dispatchDisconnection(clientID, userName);
+        this.failedPublishes.cleanupForClient(clientID);
+    }
 }

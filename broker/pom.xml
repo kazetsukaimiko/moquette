@@ -5,7 +5,7 @@
         <relativePath>../pom.xml</relativePath>
         <artifactId>moquette-parent</artifactId>
         <groupId>io.moquette</groupId>
-        <version>0.16-SNAPSHOT</version>
+        <version>0.17-SNAPSHOT</version>
     </parent>
 
     <artifactId>moquette-broker</artifactId>
@@ -14,28 +14,26 @@
 
     <properties>
         <project.build.sourceEncoding>UTF-8</project.build.sourceEncoding>
-        <netty.tcnative.version>2.0.34.Final</netty.tcnative.version>
+        <netty.version>4.1.77.Final</netty.version>
+        <!-- Check Netty pom.xm to know the right version of tcnative, for example
+             https://github.com/netty/netty/blob/netty-4.1.73.Final/pom.xml#L531 -->
+        <netty.tcnative.version>2.0.52.Final</netty.tcnative.version>
         <paho.version>1.2.5</paho.version>
-        <h2.version>1.4.200</h2.version>
+        <h2.version>2.1.212</h2.version>
     </properties>
 
     <dependencies>
         <dependency>
-            <groupId>io.moquette</groupId>
-            <artifactId>moquette-sink-api</artifactId>
-        </dependency>
-
-        <dependency>
             <groupId>org.slf4j</groupId>
             <artifactId>slf4j-api</artifactId>
-            <version>1.7.25</version>
+            <version>${slf4j.version}</version>
         </dependency>
 
         <dependency>
             <!-- This is used to use log4j12 implementation -->
             <groupId>org.slf4j</groupId>
-            <artifactId>slf4j-log4j12</artifactId>
-            <version>1.7.25</version>
+            <artifactId>slf4j-reload4j</artifactId>
+            <version>${slf4j.version}</version>
             <scope>runtime</scope>
         </dependency>
 
@@ -131,7 +129,7 @@
         <dependency>
             <groupId>commons-codec</groupId>
             <artifactId>commons-codec</artifactId>
-            <version>1.10</version>
+            <version>1.15</version>
         </dependency>
 
         <dependency>
@@ -169,6 +167,12 @@
             <version>${h2.version}</version>
             <scope>test</scope>
         </dependency>
+        <dependency>
+            <groupId>org.jetbrains</groupId>
+            <artifactId>annotations</artifactId>
+            <version>RELEASE</version>
+            <scope>test</scope>
+        </dependency>
     </dependencies>
 
     <build>
@@ -200,28 +204,26 @@
 <!--                </executions>-->
 <!--            </plugin>-->
 
-            <plugin>
-                <groupId>org.apache.maven.plugins</groupId>
-                <artifactId>maven-compiler-plugin</artifactId>
-                <version>3.8.0</version>
-                <configuration>
-                    <source>8</source>
-                    <target>8</target>
-                    <compilerArgs>
-                        <arg>-XDcompilePolicy=simple</arg>
-                        <!--<arg>-Xplugin:ErrorProne</arg>-->
-                    </compilerArgs>
-                    <!-- Cannot get builds working with this
-                    <annotationProcessorPaths>
-                        <path>
-                            <groupId>com.google.errorprone</groupId>
-                            <artifactId>error_prone_core</artifactId>
-                            <version>2.4.0</version>
-                        </path>
-                    </annotationProcessorPaths>
-                    -->
-                </configuration>
-            </plugin>
+<!--            <plugin>-->
+<!--                <groupId>org.apache.maven.plugins</groupId>-->
+<!--                <artifactId>maven-compiler-plugin</artifactId>-->
+<!--                <version>3.8.0</version>-->
+<!--                <configuration>-->
+<!--                    <source>1.8</source>-->
+<!--                    <target>1.8</target>-->
+<!--                    <compilerArgs>-->
+<!--                        <arg>-XDcompilePolicy=simple</arg>-->
+<!--                        <arg>-Xplugin:ErrorProne</arg>-->
+<!--                    </compilerArgs>-->
+<!--                    <annotationProcessorPaths>-->
+<!--                        <path>-->
+<!--                            <groupId>com.google.errorprone</groupId>-->
+<!--                            <artifactId>error_prone_core</artifactId>-->
+<!--                            <version>2.4.0</version>-->
+<!--                        </path>-->
+<!--                    </annotationProcessorPaths>-->
+<!--                </configuration>-->
+<!--            </plugin>-->
 
             <plugin>
                 <groupId>com.github.spotbugs</groupId>

@@ -166,8 +166,10 @@ public class ServerIntegrationSSLClientAuthTest {
         sslProps.put(BrokerConstants.JKS_PATH_PROPERTY_NAME, "src/test/resources/serverkeystore.jks");
         sslProps.put(BrokerConstants.KEY_STORE_PASSWORD_PROPERTY_NAME, "passw0rdsrv");
         sslProps.put(BrokerConstants.KEY_MANAGER_PASSWORD_PROPERTY_NAME, "passw0rdsrv");
-        sslProps.put(BrokerConstants.PERSISTENT_STORE_PROPERTY_NAME, dbPath);
+        sslProps.put(BrokerConstants.DATA_PATH_PROPERTY_NAME, dbPath);
+        sslProps.put(BrokerConstants.PERSISTENCE_ENABLED_PROPERTY_NAME, "true");
         sslProps.put(BrokerConstants.NEED_CLIENT_AUTH, "true");
+        sslProps.put(BrokerConstants.ENABLE_TELEMETRY_NAME, "false");
         m_server.startServer(sslProps);
     }
 
@@ -189,9 +191,7 @@ public class ServerIntegrationSSLClientAuthTest {
 
     @AfterEach
     public void tearDown() throws Exception {
-        if (m_client != null && m_client.isConnected()) {
-            m_client.disconnect();
-        }
+        IntegrationUtils.disconnectClient(m_client);
 
         if (m_server != null) {
             m_server.stopServer();

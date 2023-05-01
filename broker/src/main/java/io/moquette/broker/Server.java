@@ -16,11 +16,6 @@
 package io.moquette.broker;
 
 import io.moquette.BrokerConstants;
-import io.moquette.api.IQueueRepository;
-import io.moquette.api.IRetainedRepository;
-import io.moquette.api.ISslContextCreator;
-import io.moquette.api.ISubscriptionsDirectory;
-import io.moquette.api.ISubscriptionsRepository;
 import io.moquette.broker.config.FileResourceLoader;
 import io.moquette.broker.config.IConfig;
 import io.moquette.broker.config.IResourceLoader;
@@ -31,27 +26,41 @@ import io.moquette.broker.security.AcceptAllAuthenticator;
 import io.moquette.broker.security.DenyAllAuthorizatorPolicy;
 import io.moquette.broker.security.IAuthenticator;
 import io.moquette.broker.security.IAuthorizatorPolicy;
-import io.moquette.broker.security.IConnectionFilter;
 import io.moquette.broker.security.PermitAllAuthorizatorPolicy;
 import io.moquette.broker.security.ResourceAuthenticator;
-import io.moquette.broker.subscriptions.CTrieSubscriptionDirectory;
-import io.moquette.interception.BrokerInterceptor;
+import io.moquette.broker.unsafequeues.QueueException;
 import io.moquette.interception.InterceptHandler;
 import io.moquette.persistence.H2Builder;
+import io.moquette.persistence.MemorySessionsRepository;
 import io.moquette.persistence.MemorySubscriptionsRepository;
+import io.moquette.interception.BrokerInterceptor;
+import io.moquette.broker.subscriptions.CTrieSubscriptionDirectory;
+import io.moquette.broker.subscriptions.ISubscriptionsDirectory;
+import io.moquette.persistence.SegmentQueueRepository;
 import io.netty.handler.codec.mqtt.MqttPublishMessage;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
+import java.io.BufferedReader;
 import java.io.File;
+import java.io.FileWriter;
 import java.io.IOException;
+import java.io.InputStreamReader;
+import java.io.OutputStream;
 import java.lang.reflect.InvocationTargetException;
+import java.net.HttpURLConnection;
+import java.net.URL;
+import java.nio.charset.StandardCharsets;
+import java.nio.file.Files;
+import java.nio.file.Path;
+import java.nio.file.Paths;
 import java.text.ParseException;
 import java.util.ArrayList;
 import java.util.Collection;
 import java.util.Collections;
 import java.util.List;
 import java.util.Properties;
+import java.util.UUID;
 import java.util.concurrent.Executors;
 import java.util.concurrent.ScheduledExecutorService;
 
@@ -60,6 +69,7 @@ import static io.moquette.logging.LoggingUtils.getInterceptorIds;
 public class Server {
 
     private static final Logger LOG = LoggerFactory.getLogger(io.moquette.broker.Server.class);
+    public static final String MOQUETTE_VERSION = "0.17-SNAPSHOT";
 
     private ScheduledExecutorService scheduler;
     private NewNettyAcceptor acceptor;
@@ -68,11 +78,16 @@ public class Server {
     private BrokerInterceptor interceptor;
     private H2Builder h2Builder;
     private SessionRegistry sessions;
+    private boolean standalone = false;
 
     public static void main(String[] args) throws IOException {
         final Server server = new Server();
-        server.startServer();
-        System.out.println("Server started, version 0.16-SNAPSHOT");
+        try {
+            server.startStandaloneServer();
+        } catch (RuntimeException e) {
+            System.exit(1);
+        }
+        System.out.println("Server started, version " + MOQUETTE_VERSION);
         //Bind a shutdown hook
         Runtime.getRuntime().addShutdownHook(new Thread(server::stopServer));
     }
@@ -88,6 +103,11 @@ public class Server {
         IResourceLoader filesystemLoader = new FileResourceLoader(defaultConfigurationFile);
         final IConfig config = new ResourceLoaderConfig(filesystemLoader);
         startServer(config);
+    }
+
+    private void startStandaloneServer() throws IOException {
+        this.standalone = true;
+        startServer();
     }
 
     private static File defaultConfigFile() {
@@ -147,11 +167,11 @@ public class Server {
      */
     public void startServer(IConfig config, List<? extends InterceptHandler> handlers) throws IOException {
         LOG.debug("Starting moquette integration using IConfig instance and intercept handlers");
-        startServer(config, handlers, null, null, null, null);
+        startServer(config, handlers, null, null, null);
     }
 
     public void startServer(IConfig config, List<? extends InterceptHandler> handlers, ISslContextCreator sslCtxCreator,
-                            IAuthenticator authenticator, IConnectionFilter connectionFilter, IAuthorizatorPolicy authorizatorPolicy) {
+                            IAuthenticator authenticator, IAuthorizatorPolicy authorizatorPolicy) throws IOException {
         final long start = System.currentTimeMillis();
         if (handlers == null) {
             handlers = Collections.emptyList();
@@ -164,8 +184,6 @@ public class Server {
         if (handlerProp != null) {
             config.setProperty(BrokerConstants.INTERCEPT_HANDLER_PROPERTY_NAME, handlerProp);
         }
-        final String persistencePath = config.getProperty(BrokerConstants.PERSISTENT_STORE_PROPERTY_NAME);
-        LOG.debug("Configuring Using persistent store file, path: {}", persistencePath);
         initInterceptors(config, handlers);
         LOG.debug("Initialized MQTT protocol processor");
         if (sslCtxCreator == null) {
@@ -173,50 +191,246 @@ public class Server {
             sslCtxCreator = new DefaultMoquetteSslContextCreator(config);
         }
         authenticator = initializeAuthenticator(authenticator, config);
-        connectionFilter = initializeConnectionFilter(connectionFilter, config);
         authorizatorPolicy = initializeAuthorizatorPolicy(authorizatorPolicy, config);
 
+        final ISessionsRepository sessionsRepository;
         final ISubscriptionsRepository subscriptionsRepository;
         final IQueueRepository queueRepository;
         final IRetainedRepository retainedRepository;
-        if (persistencePath != null && !persistencePath.isEmpty()) {
-            LOG.trace("Configuring H2 subscriptions store to {}", persistencePath);
-            h2Builder = new H2Builder(config, scheduler).initStore();
+
+        if (config.getProperty(BrokerConstants.PERSISTENT_STORE_PROPERTY_NAME) != null) {
+            LOG.warn("Using a deprecated setting {} please update to {}",
+                BrokerConstants.PERSISTENT_STORE_PROPERTY_NAME, BrokerConstants.DATA_PATH_PROPERTY_NAME);
+            LOG.warn("Forcing {} to true", BrokerConstants.PERSISTENCE_ENABLED_PROPERTY_NAME);
+            config.setProperty(BrokerConstants.PERSISTENCE_ENABLED_PROPERTY_NAME, Boolean.TRUE.toString());
+
+            final String persistencePath = config.getProperty(BrokerConstants.PERSISTENT_STORE_PROPERTY_NAME);
+            final String dataPath = persistencePath.substring(0, persistencePath.lastIndexOf("/"));
+            LOG.warn("Forcing {} to {}", BrokerConstants.DATA_PATH_PROPERTY_NAME, dataPath);
+            config.setProperty(BrokerConstants.DATA_PATH_PROPERTY_NAME, dataPath);
+        }
+
+        if (Boolean.parseBoolean(config.getProperty(BrokerConstants.PERSISTENCE_ENABLED_PROPERTY_NAME))) {
+            final Path dataPath = Paths.get(config.getProperty(BrokerConstants.DATA_PATH_PROPERTY_NAME));
+            if (!dataPath.toFile().exists()) {
+                if (dataPath.toFile().mkdirs()) {
+                    LOG.debug("Created data_path {} folder", dataPath);
+                } else {
+                    LOG.warn("Impossible to create the data_path {}", dataPath);
+                }
+            }
+
+            LOG.debug("Configuring persistent subscriptions store and queues, path: {}", dataPath);
+            final int autosaveInterval = Integer.parseInt(config.getProperty(BrokerConstants.AUTOSAVE_INTERVAL_PROPERTY_NAME, "30"));
+            h2Builder = new H2Builder(scheduler, dataPath, autosaveInterval).initStore();
+            queueRepository = initQueuesRepository(config, dataPath, h2Builder);
+            LOG.trace("Configuring H2 subscriptions repository");
             subscriptionsRepository = h2Builder.subscriptionsRepository();
-            queueRepository = h2Builder.queueRepository();
             retainedRepository = h2Builder.retainedRepository();
+            sessionsRepository = h2Builder.sessionsRepository();
         } else {
             LOG.trace("Configuring in-memory subscriptions store");
             subscriptionsRepository = new MemorySubscriptionsRepository();
             queueRepository = new MemoryQueueRepository();
             retainedRepository = new MemoryRetainedRepository();
+            sessionsRepository = new MemorySessionsRepository();
         }
 
         ISubscriptionsDirectory subscriptions = new CTrieSubscriptionDirectory();
         subscriptions.init(subscriptionsRepository);
         final Authorizator authorizator = new Authorizator(authorizatorPolicy);
-        sessions = new SessionRegistry(subscriptions, queueRepository, authorizator);
-        dispatcher = new PostOffice(subscriptions, retainedRepository, sessions, interceptor, authorizator);
+        sessions = new SessionRegistry(subscriptions, sessionsRepository, queueRepository, authorizator);
+        final int sessionQueueSize = config.intProp(BrokerConstants.SESSION_QUEUE_SIZE, 1024);
+        final SessionEventLoopGroup loopsGroup = new SessionEventLoopGroup(interceptor, sessionQueueSize);
+        dispatcher = new PostOffice(subscriptions, retainedRepository, sessions, interceptor, authorizator,
+            loopsGroup);
         final BrokerConfiguration brokerConfig = new BrokerConfiguration(config);
-        MQTTConnectionFactory connectionFactory = new MQTTConnectionFactory(brokerConfig, authenticator, connectionFilter, sessions,
+        MQTTConnectionFactory connectionFactory = new MQTTConnectionFactory(brokerConfig, authenticator, sessions,
                                                                             dispatcher);
 
         final NewNettyMQTTHandler mqttHandler = new NewNettyMQTTHandler(connectionFactory);
         acceptor = new NewNettyAcceptor();
-        acceptor.initialize(mqttHandler, config, sslCtxCreator);
+        acceptor.initialize(mqttHandler, config, sslCtxCreator, brokerConfig);
 
         final long startTime = System.currentTimeMillis() - start;
         LOG.info("Moquette integration has been started successfully in {} ms", startTime);
+
+        if (config.boolProp(BrokerConstants.ENABLE_TELEMETRY_NAME, true)) {
+            collectAndSendTelemetryDataAsynch(config);
+        }
+
         initialized = true;
     }
 
-    private IConnectionFilter initializeConnectionFilter(IConnectionFilter connectionFilter, IConfig props) {
-        LOG.debug("Configuring MQTT connection filter policy");
-        String filterClassName = props.getProperty(BrokerConstants.CONNECTION_FILTER_CLASS_NAME, "");
-        if (connectionFilter == null && !filterClassName.isEmpty()) {
-            connectionFilter = loadClass(filterClassName, IConnectionFilter.class, IConfig.class, props);
+    private static IQueueRepository initQueuesRepository(IConfig config, Path dataPath, H2Builder h2Builder) throws IOException {
+        final IQueueRepository queueRepository;
+        final String queueType = config.getProperty(BrokerConstants.PERSISTENT_QUEUE_TYPE_PROPERTY_NAME);
+        if ("h2".equalsIgnoreCase(queueType)) {
+            LOG.info("Configuring H2 queue store");
+            queueRepository = h2Builder.queueRepository();
+        } else if ("segmented".equalsIgnoreCase(queueType)) {
+            LOG.info("Configuring segmented queue store to {}", dataPath);
+            final int pageSize = config.intProp(BrokerConstants.SEGMENTED_QUEUE_PAGE_SIZE, BrokerConstants.DEFAULT_SEGMENTED_QUEUE_PAGE_SIZE);
+            final int segmentSize = config.intProp(BrokerConstants.SEGMENTED_QUEUE_SEGMENT_SIZE, BrokerConstants.DEFAULT_SEGMENTED_QUEUE_SEGMENT_SIZE);
+            try {
+                queueRepository = new SegmentQueueRepository(dataPath, pageSize, segmentSize);
+            } catch (QueueException e) {
+                throw new IOException("Problem in configuring persistent queue on path " + dataPath, e);
+            }
+        } else {
+            final String errMsg = String.format("Invalid property for %s found [%s] while only h2 or segmented are admitted", BrokerConstants.PERSISTENT_QUEUE_TYPE_PROPERTY_NAME, queueType);
+            throw new RuntimeException(errMsg);
         }
-        return connectionFilter;
+        return queueRepository;
+    }
+
+    private void collectAndSendTelemetryDataAsynch(IConfig config) {
+        final Thread telCollector = new Thread(() -> collectAndSendTelemetryData(config));
+        telCollector.start();
+    }
+
+    private void collectAndSendTelemetryData(IConfig config) {
+        final String uuid = checkOrCreateUUID(config);
+
+        final String telemetryDoc = collectTelemetryData(uuid);
+
+        try {
+            sendTelemetryData(telemetryDoc);
+        } catch (IOException e) {
+            LOG.info("Can't reach the telemetry collector");
+            if (LOG.isDebugEnabled()) {
+                LOG.debug("Original exception", e);
+            }
+        }
+    }
+
+    private String checkOrCreateUUID(IConfig config) {
+        final String storagePath = config.getProperty(BrokerConstants.DATA_PATH_PROPERTY_NAME, "");
+        final Path uuidFilePath = Paths.get(storagePath, ".moquette_uuid");
+        if (Files.exists(uuidFilePath)) {
+            try {
+                return new String(Files.readAllBytes(uuidFilePath), StandardCharsets.UTF_8);
+            } catch (IOException e) {
+                LOG.error("Problem accessing file path: {}", uuidFilePath, e);
+            }
+        }
+        final UUID uuid = UUID.randomUUID();
+        final FileWriter f;
+        try {
+            f = new FileWriter(uuidFilePath.toFile(), false);
+            f.write(uuid.toString());
+            f.close();
+        } catch (IOException e) {
+            LOG.error("Problem writing new UUID to file path: {}", uuidFilePath, e);
+        }
+
+        return uuid.toString();
+    }
+
+    /**
+     * @return a json string with the content of max mem, jvm version and similar telemetry data.
+     * @param uuid*/
+    private String collectTelemetryData(String uuid) {
+        final String remoteIp = retrievePublicIP();
+        final String os = System.getProperty("os.name");
+        final String cpuArch = System.getProperty("os.arch");
+        final String jvmVersion = System.getProperty("java.specification.version");
+        final String jvmVendor = System.getProperty("java.vendor");
+        final long maxMemory = Runtime.getRuntime().maxMemory();
+        final String maxHeap = maxMemory == Long.MAX_VALUE ? "undefined" : Long.toString(maxMemory);
+
+        return String.format(
+            "{\"os\": \"%s\", " +
+                "\"cpu_arch\": \"%s\", " +
+                "\"jvm_version\": \"%s\", " +
+                "\"jvm_vendor\": \"%s\", " +
+                "\"broker_version\": \"%s\", " +
+                "\"standalone\": %s," +
+                "\"max_heap\": \"%s\", " +
+                "\"remote_ip\": \"%s\", " +
+                "\"uuid\": \"%s\"}",
+            os, cpuArch, jvmVersion, jvmVendor, MOQUETTE_VERSION, this.standalone, maxHeap, remoteIp, uuid);
+    }
+
+    private String retrievePublicIP() {
+        try {
+            URL url = new URL("http://whatismyip.akamai.com");
+            HttpURLConnection con = (HttpURLConnection) url.openConnection();
+            final int status = con.getResponseCode();
+            if (status != HttpURLConnection.HTTP_OK) {
+                LOG.debug("What's my IP service replied with {}", status);
+                return "";
+            }
+
+            BufferedReader in = new BufferedReader(new InputStreamReader(con.getInputStream()));
+            return in.readLine();
+        } catch (Exception e) {
+            LOG.debug("Can't connect to what's my IP service");
+            return "";
+        }
+    }
+
+    private void sendTelemetryData(String telemetryDoc) throws IOException {
+        URL url = new URL("https://telemetry.moquette.io/api/v1/notify");
+        HttpURLConnection con = (HttpURLConnection) url.openConnection();
+        con.setRequestMethod("POST");
+        con.setRequestProperty("Content-Type", "application/json");
+        con.setRequestProperty("Accept", "application/json");
+        con.setInstanceFollowRedirects(true);
+
+        // POST
+        con.setDoOutput(true);
+        final byte[] input = telemetryDoc.getBytes("utf-8");
+        try (OutputStream os = con.getOutputStream()) {
+            os.write(input, 0, input.length);
+        }
+
+        int status = con.getResponseCode();
+        LOG.trace("Response code is {}", status);
+
+        boolean redirect = false;
+
+        // normally, 3xx is redirect
+        if (status != HttpURLConnection.HTTP_OK) {
+            if (status == HttpURLConnection.HTTP_MOVED_TEMP
+                || status == HttpURLConnection.HTTP_MOVED_PERM
+                || status == HttpURLConnection.HTTP_SEE_OTHER)
+                redirect = true;
+        }
+
+        LOG.trace("Response Code: {} ", status);
+
+        if (redirect) {
+
+            // get redirect url from "location" header field
+            String newUrl = con.getHeaderField("Location");
+
+            // open the new connnection again
+            con = (HttpURLConnection) new URL(newUrl).openConnection();
+            con.addRequestProperty("Accept-Language", "en-US,en;q=0.8");
+            con.addRequestProperty("User-Agent", "Mozilla");
+            con.addRequestProperty("Referer", "google.com");
+            con.setRequestMethod("POST");
+
+            // POST
+            con.setDoOutput(true);
+            try (OutputStream os = con.getOutputStream()) {
+                os.write(input, 0, input.length);
+            }
+
+            LOG.trace("Redirect to URL: {}", newUrl);
+        }
+
+        BufferedReader in = new BufferedReader(new InputStreamReader(con.getInputStream()));
+        String inputLine;
+        StringBuffer content = new StringBuffer();
+        while ((inputLine = in.readLine()) != null) {
+            content.append(inputLine);
+        }
+        in.close();
+        LOG.trace("Content: {}", content);
+
+        con.disconnect();
     }
 
     private IAuthorizatorPolicy initializeAuthorizatorPolicy(IAuthorizatorPolicy authorizatorPolicy, IConfig props) {
@@ -325,8 +539,9 @@ public class Server {
      * @param msg      the message to forward. The ByteBuf in the message will be released.
      * @param clientId the id of the sending integration.
      * @throws IllegalStateException if the integration is not yet started
+     * @return
      */
-    public void internalPublish(MqttPublishMessage msg, final String clientId) {
+    public RoutingResults internalPublish(MqttPublishMessage msg, final String clientId) {
         final int messageID = msg.variableHeader().packetId();
         if (!initialized) {
             LOG.error("Moquette is not started, internal message cannot be published. CId: {}, messageId: {}", clientId,
@@ -334,12 +549,17 @@ public class Server {
             throw new IllegalStateException("Can't publish on a integration is not yet started");
         }
         LOG.trace("Internal publishing message CId: {}, messageId: {}", clientId, messageID);
-        dispatcher.internalPublish(msg);
+        final RoutingResults routingResults = dispatcher.internalPublish(msg);
         msg.payload().release();
+        return routingResults;
     }
 
     public void stopServer() {
         LOG.info("Unbinding integration from the configured ports");
+        if (acceptor == null) {
+            LOG.error("Closing a badly started server, exit immediately");
+            return;
+        }
         acceptor.close();
         LOG.trace("Stopping MQTT protocol processor");
         initialized = false;
@@ -348,12 +568,15 @@ public class Server {
         // and SessionsRepository does not stop its tasks. Thus shutdownNow().
         scheduler.shutdownNow();
 
+        sessions.close();
+
         if (h2Builder != null) {
             LOG.trace("Shutting down H2 persistence {}");
             h2Builder.closeStore();
         }
 
         interceptor.stop();
+        dispatcher.terminate();
         LOG.info("Moquette integration has been stopped.");
     }
 

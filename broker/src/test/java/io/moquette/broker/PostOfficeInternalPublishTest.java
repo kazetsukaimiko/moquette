@@ -35,7 +35,11 @@ import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 
 import java.util.Set;
+import java.util.concurrent.ExecutionException;
+import java.util.concurrent.TimeUnit;
 
+import static io.moquette.broker.MQTTConnectionPublishTest.memorySessionsRepository;
+import static io.moquette.BrokerConstants.NO_BUFFER_FLUSH;
 import static io.moquette.broker.PostOfficeUnsubscribeTest.CONFIG;
 import static io.netty.handler.codec.mqtt.MqttQoS.AT_LEAST_ONCE;
 import static io.netty.handler.codec.mqtt.MqttQoS.AT_MOST_ONCE;
@@ -61,20 +65,20 @@ public class PostOfficeInternalPublishTest {
     private SessionRegistry sessionRegistry;
     private MockAuthenticator mockAuthenticator;
     private static final BrokerConfiguration ALLOW_ANONYMOUS_AND_ZERO_BYTES_CLID =
-        new BrokerConfiguration(true, true, false, false);
+        new BrokerConfiguration(true, true, false, NO_BUFFER_FLUSH);
     private MemoryRetainedRepository retainedRepository;
     private MemoryQueueRepository queueRepository;
 
     @BeforeEach
-    public void setUp() {
-        sessionRegistry = initPostOfficeAndSubsystems();
+    public void setUp() throws ExecutionException, InterruptedException {
+        initPostOfficeAndSubsystems();
 
         mockAuthenticator = new MockAuthenticator(singleton(FAKE_CLIENT_ID), singletonMap(TEST_USER, TEST_PWD));
         connection = createMQTTConnection(ALLOW_ANONYMOUS_AND_ZERO_BYTES_CLID);
 
         connectMessage = ConnectionTestUtils.buildConnect(FAKE_CLIENT_ID);
 
-        connection.processConnect(connectMessage);
+        connection.processConnect(connectMessage).completableFuture().get();
         ConnectionTestUtils.assertConnectAccepted(channel);
     }
 
@@ -87,7 +91,7 @@ public class PostOfficeInternalPublishTest {
         return new MQTTConnection(channel, config, mockAuthenticator, null, sessionRegistry, sut);
     }
 
-    private SessionRegistry initPostOfficeAndSubsystems() {
+    private void initPostOfficeAndSubsystems() {
         subscriptions = new CTrieSubscriptionDirectory();
         ISubscriptionsRepository subscriptionsRepository = new MemorySubscriptionsRepository();
         subscriptions.init(subscriptionsRepository);
@@ -96,10 +100,10 @@ public class PostOfficeInternalPublishTest {
 
         final PermitAllAuthorizatorPolicy authorizatorPolicy = new PermitAllAuthorizatorPolicy();
         final Authorizator permitAll = new Authorizator(authorizatorPolicy);
-        SessionRegistry sessionRegistry = new SessionRegistry(subscriptions, queueRepository, permitAll);
+        sessionRegistry = new SessionRegistry(subscriptions, memorySessionsRepository(), queueRepository, permitAll);
+        final SessionEventLoopGroup loopsGroup = new SessionEventLoopGroup(ConnectionTestUtils.NO_OBSERVERS_INTERCEPTOR, 1024);
         sut = new PostOffice(subscriptions, retainedRepository, sessionRegistry,
-                             ConnectionTestUtils.NO_OBSERVERS_INTERCEPTOR, permitAll);
-        return sessionRegistry;
+                             ConnectionTestUtils.NO_OBSERVERS_INTERCEPTOR, permitAll, loopsGroup);
     }
 
     private void internalPublishNotRetainedTo(String topic) {
@@ -116,7 +120,12 @@ public class PostOfficeInternalPublishTest {
             .retained(retained)
             .qos(qos)
             .payload(Unpooled.copiedBuffer(PAYLOAD.getBytes(UTF_8))).build();
-        sut.internalPublish(publish);
+        final RoutingResults res = sut.internalPublish(publish);
+        try {
+            res.completableFuture().get(5, TimeUnit.SECONDS);
+        } catch (Exception ex) {
+            throw new RuntimeException(ex);
+        }
     }
 
     @Test
@@ -129,6 +138,7 @@ public class PostOfficeInternalPublishTest {
         internalPublishNotRetainedTo(topic);
 
         subscribe(AT_MOST_ONCE, topic, connection);
+        completeEventLoopCommands();
 
         // Verify
         verifyNoPublishIsReceived(channel);
@@ -141,6 +151,7 @@ public class PostOfficeInternalPublishTest {
         internalPublishRetainedTo(topic);
 
         subscribe(AT_MOST_ONCE, topic, connection);
+        completeEventLoopCommands();
 
         // Verify
         verifyNoPublishIsReceived(channel);
@@ -152,6 +163,7 @@ public class PostOfficeInternalPublishTest {
 
         // Exercise
         internalPublishNotRetainedTo("/topic");
+        completeEventLoopCommands();
 
         // Verify
         ConnectionTestUtils.verifyPublishIsReceived(channel, AT_MOST_ONCE, PAYLOAD);
@@ -163,9 +175,15 @@ public class PostOfficeInternalPublishTest {
 
         // Exercise
         internalPublishRetainedTo("/topic");
+        completeEventLoopCommands();
 
         // Verify
         ConnectionTestUtils.verifyPublishIsReceived(channel, AT_MOST_ONCE, PAYLOAD);
+    }
+
+    private void completeEventLoopCommands() {
+        // shutdown event loop threads to complete all queued commands
+        sut.terminate();
     }
 
     @Test
@@ -174,6 +192,7 @@ public class PostOfficeInternalPublishTest {
 
         // Exercise
         internalPublishTo("/topic", AT_LEAST_ONCE, false);
+        completeEventLoopCommands();
 
         // Verify
         ConnectionTestUtils.verifyPublishIsReceived(channel, AT_LEAST_ONCE, PAYLOAD);
@@ -184,17 +203,19 @@ public class PostOfficeInternalPublishTest {
         // Exercise
         internalPublishTo("/topic", AT_LEAST_ONCE, false);
         subscribe(AT_LEAST_ONCE, "/topic", connection);
+        completeEventLoopCommands();
 
         // Verify
         verifyNoPublishIsReceived(channel);
     }
 
     @Test
-    public void testClientSubscribeBeforeRetainedQoS1IsSent() {
+    public void testClientSubscribeBeforeRetainedQoS1IsSent() throws Exception {
         subscribe(AT_LEAST_ONCE, "/topic", connection);
 
         // Exercise
         internalPublishTo("/topic", AT_LEAST_ONCE, true);
+        completeEventLoopCommands();
 
         // Verify
         ConnectionTestUtils.verifyPublishIsReceived(channel, AT_LEAST_ONCE, PAYLOAD);
@@ -205,17 +226,19 @@ public class PostOfficeInternalPublishTest {
         // Exercise
         internalPublishTo("/topic", AT_LEAST_ONCE, true);
         subscribe(AT_LEAST_ONCE, "/topic", connection);
+        completeEventLoopCommands();
 
         // Verify
         ConnectionTestUtils.verifyPublishIsReceived(channel, AT_LEAST_ONCE, PAYLOAD);
     }
 
     @Test
-    public void testClientSubscribeBeforeNotRetainedQoS2IsSent() {
+    public void testClientSubscribeBeforeNotRetainedQoS2IsSent() throws Exception {
         subscribe(EXACTLY_ONCE, "/topic", connection);
 
         // Exercise
         internalPublishTo("/topic", EXACTLY_ONCE, false);
+        completeEventLoopCommands();
 
         // Verify
         ConnectionTestUtils.verifyPublishIsReceived(channel, EXACTLY_ONCE, PAYLOAD);
@@ -226,6 +249,7 @@ public class PostOfficeInternalPublishTest {
         // Exercise
         internalPublishTo("/topic", EXACTLY_ONCE, false);
         subscribe(EXACTLY_ONCE, "/topic", connection);
+        completeEventLoopCommands();
 
         // Verify
         verifyNoPublishIsReceived(channel);
@@ -237,8 +261,10 @@ public class PostOfficeInternalPublishTest {
 
         // Exercise
         internalPublishTo("/topic", EXACTLY_ONCE, true);
+        completeEventLoopCommands();
 
         // Verify
+        assertNotNull(channel, "channel can't be null");
         ConnectionTestUtils.verifyPublishIsReceived(channel, EXACTLY_ONCE, PAYLOAD);
     }
 
@@ -247,6 +273,7 @@ public class PostOfficeInternalPublishTest {
         // Exercise
         internalPublishTo("/topic", EXACTLY_ONCE, true);
         subscribe(EXACTLY_ONCE, "/topic", connection);
+        completeEventLoopCommands();
 
         // Verify
         ConnectionTestUtils.verifyPublishIsReceived(channel, EXACTLY_ONCE, PAYLOAD);
@@ -258,12 +285,13 @@ public class PostOfficeInternalPublishTest {
         connection.processDisconnect(null);
 
         internalPublishTo("foo", AT_MOST_ONCE, false);
+        completeEventLoopCommands();
 
         verifyNoPublishIsReceived(channel);
     }
 
     @Test
-    public void testClientSubscribeWithoutCleanSession() {
+    public void testClientSubscribeWithoutCleanSession() throws ExecutionException, InterruptedException {
         subscribe(AT_MOST_ONCE, "foo", connection);
         connection.processDisconnect(null);
         assertEquals(1, subscriptions.size());
@@ -274,12 +302,13 @@ public class PostOfficeInternalPublishTest {
             .clientId(FAKE_CLIENT_ID)
             .cleanSession(false)
             .build();
-        anotherConn.processConnect(connectMessage);
-        ConnectionTestUtils.assertConnectAccepted((EmbeddedChannel) anotherConn.channel);
+        anotherConn.processConnect(connectMessage).completableFuture().get();
+        ConnectionTestUtils.assertConnectAccepted(anotherConn);
 
         assertEquals(1, subscriptions.size());
         internalPublishTo("foo", MqttQoS.AT_MOST_ONCE, false);
-        ConnectionTestUtils.verifyPublishIsReceived((EmbeddedChannel) anotherConn.channel, AT_MOST_ONCE, PAYLOAD);
+        completeEventLoopCommands();
+        ConnectionTestUtils.verifyPublishIsReceived(anotherConn, AT_MOST_ONCE, PAYLOAD);
     }
 
     private void subscribe(MqttQoS topic, String newsTopic, MQTTConnection connection) {

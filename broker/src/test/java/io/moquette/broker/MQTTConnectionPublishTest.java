@@ -15,11 +15,11 @@
  */
 package io.moquette.broker;
 
-import io.moquette.api.ISubscriptionsDirectory;
-import io.moquette.api.ISubscriptionsRepository;
-import io.moquette.broker.security.IAuthenticator;
 import io.moquette.broker.security.PermitAllAuthorizatorPolicy;
 import io.moquette.broker.subscriptions.CTrieSubscriptionDirectory;
+import io.moquette.broker.subscriptions.ISubscriptionsDirectory;
+import io.moquette.broker.security.IAuthenticator;
+import io.moquette.persistence.MemorySessionsRepository;
 import io.moquette.persistence.MemorySubscriptionsRepository;
 import io.netty.buffer.ByteBuf;
 import io.netty.buffer.Unpooled;
@@ -29,9 +29,13 @@ import io.netty.handler.codec.mqtt.MqttMessageBuilders;
 import io.netty.handler.codec.mqtt.MqttPublishMessage;
 import io.netty.handler.codec.mqtt.MqttQoS;
 import io.netty.handler.codec.mqtt.MqttVersion;
+//import org.jetbrains.annotations.NotNull;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 
+import java.util.concurrent.ExecutionException;
+
+import static io.moquette.BrokerConstants.NO_BUFFER_FLUSH;
 import static java.nio.charset.StandardCharsets.UTF_8;
 import static java.util.Collections.singleton;
 import static java.util.Collections.singletonMap;
@@ -53,13 +57,14 @@ public class MQTTConnectionPublishTest {
     public void setUp() {
         connMsg = MqttMessageBuilders.connect().protocolVersion(MqttVersion.MQTT_3_1).cleanSession(true);
 
-        BrokerConfiguration config = new BrokerConfiguration(true, true, false, false);
+        BrokerConfiguration config = new BrokerConfiguration(true, true, false, NO_BUFFER_FLUSH);
 
         createMQTTConnection(config);
     }
 
     private void createMQTTConnection(BrokerConfiguration config) {
         channel = new EmbeddedChannel();
+        NettyUtils.clientID(channel, "test_client");
         sut = createMQTTConnection(config, channel);
     }
 
@@ -74,14 +79,20 @@ public class MQTTConnectionPublishTest {
 
         final PermitAllAuthorizatorPolicy authorizatorPolicy = new PermitAllAuthorizatorPolicy();
         final Authorizator permitAll = new Authorizator(authorizatorPolicy);
-        sessionRegistry = new SessionRegistry(subscriptions, queueRepository, permitAll);
+        sessionRegistry = new SessionRegistry(subscriptions, memorySessionsRepository(), queueRepository, permitAll);
+        final SessionEventLoopGroup loopsGroup = new SessionEventLoopGroup(ConnectionTestUtils.NO_OBSERVERS_INTERCEPTOR, 1024);
         final PostOffice postOffice = new PostOffice(subscriptions,
-            new MemoryRetainedRepository(), sessionRegistry, ConnectionTestUtils.NO_OBSERVERS_INTERCEPTOR, permitAll);
-        return new MQTTConnection(channel, config, mockAuthenticator, null, sessionRegistry, postOffice);
+            new MemoryRetainedRepository(), sessionRegistry, ConnectionTestUtils.NO_OBSERVERS_INTERCEPTOR, permitAll, loopsGroup);
+        return new MQTTConnection(channel, config, mockAuthenticator, sessionRegistry, postOffice);
+    }
+
+//    @NotNull
+    static ISessionsRepository memorySessionsRepository() {
+        return new MemorySessionsRepository();
     }
 
     @Test
-    public void dropConnectionOnPublishWithInvalidTopicFormat() {
+    public void dropConnectionOnPublishWithInvalidTopicFormat() throws ExecutionException, InterruptedException {
         // Connect message with clean session set to true and client id is null.
         final ByteBuf payload = Unpooled.copiedBuffer("Hello MQTT world!".getBytes(UTF_8));
         MqttPublishMessage publish = MqttMessageBuilders.publish()
@@ -90,7 +101,7 @@ public class MQTTConnectionPublishTest {
             .qos(MqttQoS.AT_MOST_ONCE)
             .payload(payload).build();
 
-        sut.processPublish(publish);
+        sut.processPublish(publish).completableFuture().get();
 
         // Verify
         assertFalse(channel.isOpen(), "Connection should be closed by the broker");

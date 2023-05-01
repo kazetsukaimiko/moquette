@@ -92,10 +92,7 @@ public class ServerIntegrationMultiConnectTest {
 
     @AfterEach
     public void tearDown() throws Exception {
-        if (client != null && client.isConnected()) {
-            client.disconnect();
-        }
-
+        IntegrationUtils.disconnectClient(client);
         server.stopServer();
     }
 
